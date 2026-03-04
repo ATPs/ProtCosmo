@@ -61,24 +61,159 @@ ESTIMATION_NOTE = (
 )
 
 
+class ProtCosmoHelpFormatter(argparse.RawTextHelpFormatter):
+    """Help formatter with wider layout for readable multiline option docs."""
+
+    def __init__(self, prog: str) -> None:
+        super().__init__(prog, max_help_position=36, width=118)
+
+
+SHORT_DESCRIPTION = """
+ProtCosmo runs CometPlus searches, statically re-scores PIN candidates with Percolator weights,
+selects one winner PSM per spectrum, and reports novel-only findings.
+
+Use --help-full for step-by-step workflow, file-format details, and examples.
+""".strip()
+
+
+SHORT_EPILOG = f"""
+Quick format notes:
+- --novel_protein: FASTA input.
+- --novel_peptide: FASTA or tokenized text (comma/space/tab/newline delimiters).
+- --scan/--scan_numbers/--first-scan/--last-scan: only applied when exactly one run is resolved.
+- --input_tsv columns: mass-file, params, database, init-weights, percolator-psms, percolator-peptides.
+
+{ESTIMATION_NOTE}
+""".strip()
+
+
 FULL_HELP_TEXT = f"""
-Detailed behavior:
-1. ProtCosmo runs CometPlus search per input mass file.
-2. It reads generated PIN candidates and applies static linear scoring using percolator weights.
-3. It selects the best PSM per spectrum.
-4. It marks novel-only winners by protein id prefix COMETPLUS_NOVEL_.
-5. It estimates q-value/PEP from percolator target tables by closest-smaller score mapping.
-6. It writes novel-only reports and run metadata files.
+Detailed workflow:
 
-Scoring:
-1. Use numeric rows 1/3/5 from --init-weights.
-2. For each row/model: score = w^T x + b.
-3. Final candidate score = mean of three model scores.
+Step 1. Build run configuration
+- Read one or more runs from CLI values and optional --input_tsv.
+- In --input_tsv mode:
+  - ignore blank lines and lines starting with '#'
+  - supported headers: mass-file, params, database, init-weights, percolator-psms, percolator-peptides
+  - underscore aliases also work (example: mass_file, init_weights)
+  - CLI values override TSV values field-by-field for every row
+- Row expansion:
+  - mass-file can contain N comma-separated paths
+  - params/database/init-weights/percolator-psms/percolator-peptides:
+    - 1 value => broadcast to all N mass files
+    - N values => 1:1 mapping with mass files
+- Scan-filter gating:
+  - --scan/--scan_numbers/--first-scan/--last-scan are applied only when final run count is 1
+  - when run count > 1, scan filters are ignored and warning is logged
 
-Tie-break in winner selection:
-1. Higher score wins.
-2. On tie, non-novel winner is preferred over novel-only winner.
-3. If still tied, lower rank in SpecId is preferred.
+Step 2. Run CometPlus for each mass file
+- ProtCosmo builds a CometPlus command with:
+  --params, --database, --output_percolatorfile 1, --max_duplicate_proteins -1, --name <run_dir>/comet
+- Optional ProtCosmo-controlled options forwarded to CometPlus:
+  --novel_protein, --novel_peptide, --thread, scan filters (single-run only)
+- Unknown options are passed through to CometPlus unchanged.
+- Each run writes logs to:
+  comet_outputs/run_xxxx/cometplus.stdout.log
+  comet_outputs/run_xxxx/cometplus.stderr.log
+- PIN output is detected from generated .pin/.pin.gz/.pin.parquet(.gz)
+
+Step 3. Static scoring from --init-weights
+- --init-weights is a Percolator weights file used for re-scoring PIN candidates.
+- ProtCosmo always parses numeric rows 1, 3, and 5.
+- For each selected row/model: score_k = w_k^T x + b_k  (b_k is column m0)
+- Final candidate score: final_score = mean(score_1, score_3, score_5)
+
+Step 4. Select winner per spectrum
+- Winner selection per spectrum:
+  1) higher final_score wins
+  2) on score tie, non-novel winner is preferred over novel-only winner
+  3) if still tied, smaller SpecId rank wins
+- Novel-only means every protein ID in winner starts with COMETPLUS_NOVEL_
+
+Step 5. Estimate q-value/PEP by lookup
+- PSM-level estimate uses --percolator-psms.
+- Peptide-level estimate for novel winners uses --percolator-peptides.
+- Reference format: TSV or Parquet.
+- Required logical columns (name variants accepted):
+  score, q-value, posterior_error_prob/pep
+- Lookup rule: nearest smaller-or-equal score.
+- Fallback when no smaller score exists: q-value=1 and PEP=1 (warning logged).
+
+Step 6. Write outputs
+- protcosmo.novel_psms.tsv
+- protcosmo.novel_peptides.modified.tsv
+- protcosmo.warnings.log
+- protcosmo.run_metadata.json
+
+Option details and format examples:
+
+--novel_protein <file>
+- FASTA input only.
+- Example:
+  >novel_protein_1
+  MPEPTIDEKQLA
+
+--novel_peptide <file>
+- Two supported formats:
+  1) FASTA (auto-detected if any non-empty trimmed line starts with '>')
+  2) tokenized text (comma/space/tab/newline delimiters)
+- Tokenized mode normalization in CometPlus:
+  - keep alphabetic chars only
+  - convert to uppercase
+  - remove empty/duplicate tokens
+- Tokenized examples (valid):
+  PEPTIDEK,PEPTIDEL
+  PEPTIDEK PEPTIDEL
+  PEPTIDEK
+  PEPTIDEL
+  ACD[+57]EFG
+  K.PEPTIDE.R
+- Parsed examples become:
+  PEPTIDEK, PEPTIDEL, ACDEFG, KPEPTIDER
+
+--scan <file>
+- Text file of positive scan integers.
+- Delimiters: comma/space/tab/newline.
+- CometPlus only searches these scans.
+- ProtCosmo applies this only when exactly one mass-file run is resolved.
+
+--scan_numbers <list>
+- Inline explicit scan list with same parser as --scan.
+- Example: 1001,1002,1003
+
+--first-scan <num>
+- First/start scan number to search in CometPlus (same semantics as -F<num>).
+- Sets lower scan bound; can be used alone or with --last-scan.
+- Applies to novel peptide/protein searches and normal searches.
+- If --scan/--scan_numbers are also set, effective scans are intersection.
+- Applied only when exactly one mass-file run is resolved.
+
+--last-scan <num>
+- Last/end scan number to search in CometPlus (same semantics as -L<num>).
+- Sets upper scan bound; can be used alone or with --first-scan.
+- Applies to novel peptide/protein searches and normal searches.
+- If --scan/--scan_numbers are also set, effective scans are intersection.
+- Applied only when exactly one mass-file run is resolved.
+
+--init-weights <file>
+- Percolator weight file used to score Comet PIN candidates.
+- Expected shape: header row with feature names (must include m0), then numeric rows.
+- ProtCosmo uses numeric rows 1, 3, and 5 for the final score.
+
+--input_tsv <file>
+- Optional TSV run table.
+- Ignore blank lines and lines beginning with '#'.
+- Supported columns and meaning:
+  mass-file            mass spectrometry input file(s) for CometPlus
+  params               CometPlus params file(s)
+  database             known database file(s) passed to CometPlus
+  init-weights         Percolator weights file(s) for static scoring
+  percolator-psms      target PSM reference table(s) for q/PEP lookup
+  percolator-peptides  target peptide reference table(s) for q/PEP lookup
+- mass-file may contain comma-separated values in one row.
+- For other columns in that row: use 1 value (broadcast) or N values (1:1 with mass-file count).
+- Underscore aliases are accepted (example: mass_file, init_weights).
+- CLI values override TSV values for each row.
 
 Estimation warning:
 {ESTIMATION_NOTE}
@@ -88,49 +223,155 @@ Estimation warning:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="protcosmo",
-        description=(
-            "ProtCosmo: search novel proteins/peptides with CometPlus and estimate QC metrics "
-            "from Percolator outputs."
-        ),
-        epilog=ESTIMATION_NOTE,
+        formatter_class=ProtCosmoHelpFormatter,
+        description=SHORT_DESCRIPTION,
+        epilog=SHORT_EPILOG,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("--help-full", action="store_true", help="print full help and exit")
-    parser.add_argument("--cometplus", default="cometplus", help='path to cometplus executable')
     parser.add_argument(
+        "--help-full",
+        action="store_true",
+        help="print detailed help (workflow, file formats, and examples) and exit",
+    )
+
+    run_group = parser.add_argument_group("Core run inputs")
+    run_group.add_argument(
+        "--cometplus",
+        default="cometplus",
+        help="path to CometPlus executable (default: cometplus)",
+    )
+    run_group.add_argument(
         "--mass-file",
         dest="mass_file",
-        help="single mass file or comma-joined list of files",
+        help="one mass spectrometry file or a comma-separated list",
     )
-    parser.add_argument("--params", help="single params file or comma-joined list")
-    parser.add_argument("--database", help="single database file or comma-joined list")
-    parser.add_argument("--novel_protein", help="novel protein FASTA")
-    parser.add_argument("--novel_peptide", help="novel peptide file (FASTA or tokenized text)")
-    parser.add_argument("--thread", type=int, help="override num_threads")
-    parser.add_argument("--scan", help="scan filter file (single-file mode only)")
-    parser.add_argument(
+    run_group.add_argument(
+        "--params",
+        help=(
+            "Comet params file(s): one value (broadcast) or comma-separated list matching --mass-file count"
+        ),
+    )
+    run_group.add_argument(
+        "--database",
+        help=(
+            "known database file(s) for CometPlus --database: one value (broadcast) or comma-separated 1:1 list"
+        ),
+    )
+    run_group.add_argument(
+        "--thread",
+        type=int,
+        help="override CometPlus num_threads",
+    )
+    run_group.add_argument(
+        "--output-dir",
+        required=True,
+        help="output directory for reports, metadata, and comet_outputs/run_xxxx logs",
+    )
+
+    novel_group = parser.add_argument_group("Novel and scan-subset inputs")
+    novel_group.add_argument(
+        "--novel_protein",
+        help=(
+            "novel protein FASTA file for CometPlus novel mode.\n"
+            "These proteins are digested with active Comet settings to build novel peptide candidates."
+        ),
+    )
+    novel_group.add_argument(
+        "--novel_peptide",
+        help=(
+            "novel peptide file for CometPlus novel mode.\n"
+            "Supported formats:\n"
+            "  1) FASTA (auto-detected if any non-empty line starts with '>')\n"
+            "  2) tokenized text (delimiters: comma/space/tab/newline)\n"
+            "Tokenized examples:\n"
+            "  PEPTIDEK,PEPTIDEL\n"
+            "  PEPTIDEK PEPTIDEL\n"
+            "  one peptide per line is also valid"
+        ),
+    )
+    novel_group.add_argument(
+        "--scan",
+        help=(
+            "scan filter file (positive integers; delimiters: comma/space/tab/newline).\n"
+            "CometPlus searches only these scans.\n"
+            "ProtCosmo applies scan filters only when exactly one mass-file run is resolved."
+        ),
+    )
+    novel_group.add_argument(
         "--scan_numbers",
-        help="explicit scan list such as 1001,1002,1003 (single-file mode only)",
+        help=(
+            "inline explicit scan list, e.g. 1001,1002,1003 (same parser as --scan).\n"
+            "ProtCosmo applies this only when exactly one mass-file run is resolved."
+        ),
     )
-    parser.add_argument("--first-scan", dest="first_scan", type=int, help="alias for -F<num>")
-    parser.add_argument("--last-scan", dest="last_scan", type=int, help="alias for -L<num>")
-    parser.add_argument(
+    novel_group.add_argument(
+        "--first-scan",
+        dest="first_scan",
+        type=int,
+        help=(
+            "first/start scan number for CometPlus search (same semantics as -F<num>).\n"
+            "This is the lower scan bound for novel peptide/protein search and normal search.\n"
+            "If --scan/--scan_numbers are provided, effective scans are intersection.\n"
+            "Applied only when exactly one mass-file run is resolved."
+        ),
+    )
+    novel_group.add_argument(
+        "--last-scan",
+        dest="last_scan",
+        type=int,
+        help=(
+            "last/end scan number for CometPlus search (same semantics as -L<num>).\n"
+            "This is the upper scan bound for novel peptide/protein search and normal search.\n"
+            "If --scan/--scan_numbers are provided, effective scans are intersection.\n"
+            "Applied only when exactly one mass-file run is resolved."
+        ),
+    )
+
+    score_group = parser.add_argument_group("Scoring and reference inputs")
+    score_group.add_argument(
         "--init-weights",
         dest="init_weights",
-        help="single weights file or comma-joined list",
+        help=(
+            "Percolator weight file(s) used to score PIN candidates.\n"
+            "ProtCosmo parses numeric rows 1/3/5, applies score=w^T x + b, and averages the three scores.\n"
+            "One value may be broadcast, or provide comma-separated values matching --mass-file count."
+        ),
     )
-    parser.add_argument(
+    score_group.add_argument(
         "--percolator-psms",
         dest="percolator_psms",
-        help="target PSM reference file(s), tsv or parquet",
+        help=(
+            "target PSM reference table(s) for q-value/PEP estimation (TSV or Parquet).\n"
+            "Table must contain score, q-value, and PEP columns (name variants accepted)."
+        ),
     )
-    parser.add_argument(
+    score_group.add_argument(
         "--percolator-peptides",
         dest="percolator_peptides",
-        help="target peptide reference file(s), tsv or parquet",
+        help=(
+            "target peptide reference table(s) for q-value/PEP estimation (TSV or Parquet).\n"
+            "Table must contain score, q-value, and PEP columns (name variants accepted)."
+        ),
     )
-    parser.add_argument("--input_tsv", help="optional run-input TSV")
-    parser.add_argument("--output-dir", required=True, help="output directory")
+
+    parser.add_argument(
+        "--input_tsv",
+        help=(
+            "optional run-input TSV.\n"
+            "Ignore blank lines and lines starting with '#'.\n"
+            "Supported columns:\n"
+            "  mass-file, params, database, init-weights, percolator-psms, percolator-peptides\n"
+            "Underscore aliases are accepted (example: mass_file, init_weights).\n"
+            "Column meaning:\n"
+            "  mass-file: input mass spect file(s)\n"
+            "  params: Comet params file(s)\n"
+            "  database: known database file(s)\n"
+            "  init-weights: Percolator weights for static scoring\n"
+            "  percolator-psms: target PSM reference for q/PEP lookup\n"
+            "  percolator-peptides: target peptide reference for q/PEP lookup\n"
+            "CLI values override TSV values field-by-field."
+        ),
+    )
     return parser
 
 
