@@ -21,7 +21,6 @@ class CometRunResult:
     """Execution artifacts for one CometPlus run."""
 
     run_dir: Path
-    output_base: Path
     command: List[str]
     return_code: int
     stdout_path: Path
@@ -57,31 +56,46 @@ def _resolve_output_internal_target(command: List[str], run_dir: Path) -> Option
     return path
 
 
-def _find_pin_output(run_dir: Path, output_base: Path) -> Path:
-    candidates = [
-        Path(f"{output_base}.pin.parquet"),
-        Path(f"{output_base}.pin.parquet.gz"),
-        Path(f"{output_base}.pin"),
-        Path(f"{output_base}.pin.gz"),
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
+def _snapshot_pin_mtime(run_dir: Path) -> dict[str, float]:
+    snapshot: dict[str, float] = {}
+    for path in glob.glob(str(run_dir / "*.pin*")):
+        try:
+            snapshot[str(Path(path).resolve())] = os.path.getmtime(path)
+        except OSError:
+            continue
+    return snapshot
 
-    glob_candidates = sorted(
-        glob.glob(str(run_dir / "*.pin*")),
+
+def _find_pin_output(run_dir: Path, before_snapshot: dict[str, float]) -> Path:
+    candidates = sorted(
+        (Path(path).resolve() for path in glob.glob(str(run_dir / "*.pin*"))),
         key=lambda path: os.path.getmtime(path),
         reverse=True,
     )
-    if glob_candidates:
-        return Path(glob_candidates[0])
+    if not candidates:
+        raise FileNotFoundError(f"No PIN output was found in output directory: {run_dir}")
+
+    changed: List[Path] = []
+    for candidate in candidates:
+        key = str(candidate)
+        try:
+            mtime = os.path.getmtime(candidate)
+        except OSError:
+            continue
+        previous = before_snapshot.get(key)
+        if previous is None or mtime != previous:
+            changed.append(candidate)
+    if changed:
+        return changed[0]
+    # Fallback to newest pin if mtime resolution prevented change detection.
+    if candidates:
+        return candidates[0]
     raise FileNotFoundError(f"No PIN output was found in run directory: {run_dir}")
 
 
 def build_comet_command(
     run: RunConfig,
     config: PipelineConfig,
-    output_base: Path,
 ) -> List[str]:
     command: List[str] = [
         config.cometplus,
@@ -93,8 +107,6 @@ def build_comet_command(
         "1",
         "--max_duplicate_proteins",
         "-1",
-        "--name",
-        str(output_base),
     ]
 
     if config.novel_protein:
@@ -129,7 +141,7 @@ def build_comet_command(
             command.extend(["--last-scan", str(config.last_scan)])
 
     command.extend(config.passthrough_args)
-    command.append(_resolve_arg_path(run.mass_file))
+    command.extend(_resolve_arg_path(mass_file) for mass_file in run.mass_files)
     return command
 
 
@@ -144,8 +156,8 @@ def run_cometplus_search(
 
     run_dir = output_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    output_base = (run_dir / f"comet.run_{run.run_index:04d}").resolve()
-    command = build_comet_command(run, config, output_base)
+    command = build_comet_command(run, config)
+    before_pin_snapshot = _snapshot_pin_mtime(run_dir)
     output_internal_target = _resolve_output_internal_target(command, run_dir)
     if output_internal_target is not None and output_internal_target.exists():
         output_internal_target.unlink()
@@ -170,10 +182,9 @@ def run_cometplus_search(
             f"See logs:\n  stdout: {stdout_path}\n  stderr: {stderr_path}"
         )
 
-    pin_path = _find_pin_output(run_dir, output_base) if require_pin_output else None
+    pin_path = _find_pin_output(run_dir, before_pin_snapshot) if require_pin_output else None
     return CometRunResult(
         run_dir=run_dir,
-        output_base=output_base,
         command=command,
         return_code=proc.returncode,
         stdout_path=stdout_path,

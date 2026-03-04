@@ -108,13 +108,16 @@ Step 1. Build run configuration
 - --init-weights/--percolator-psms/--percolator-peptides:
   - 1 value => broadcast to all resolved mass files
   - N values => 1:1 mapping with resolved mass-file count
+- In novel mode (--novel_protein/--novel_peptide/--internal_novel_peptide):
+  - if multiple mass files are resolved, ProtCosmo calls CometPlus once with all inputs.
 - Scan-filter gating:
   - --scan/--scan_numbers/--first-scan/--last-scan are applied only when final run count is 1
   - when run count > 1, scan filters are ignored and warning is logged
 
 Step 2. Run CometPlus for each mass file
 - ProtCosmo builds a CometPlus command with:
-  --params, --database, --output_percolatorfile 1, --max_duplicate_proteins -1, --name <output-dir>/comet.run_xxxx
+  --params, --database, --output_percolatorfile 1, --max_duplicate_proteins -1
+- One run may include one or many spectrum input files.
 - Optional ProtCosmo-controlled options forwarded to CometPlus:
   --novel_protein, --novel_peptide, --output_internal_novel_peptide,
   --internal_novel_peptide, --stop-after-saving-novel-peptide,

@@ -16,6 +16,7 @@ class RunConfig:
     run_index: int
     row_index: int
     mass_file: str
+    mass_files: List[str]
     params: str
     database: str
     init_weights: Optional[str]
@@ -90,9 +91,24 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
 
     stop_after = bool(getattr(args, "stop_after_saving_novel_peptide", False))
     mass_files = resolve_mass_files(args.mass_file)
+    novel_mode = any(
+        x is not None and str(x).strip()
+        for x in (
+            args.novel_protein,
+            args.novel_peptide,
+            getattr(args, "internal_novel_peptide", None),
+        )
+    )
+    merge_multi_input_novel = novel_mode and len(mass_files) > 1
+    run_input_groups: List[List[str]]
+    if merge_multi_input_novel:
+        run_input_groups = [mass_files]
+    else:
+        run_input_groups = [[mass_file] for mass_file in mass_files]
+
     params = _require_single_value("--params", args.params)
     database = _require_single_value("--database", args.database)
-    count = len(mass_files)
+    count = len(run_input_groups)
 
     init_weights = _map_optional_field(
         "--init-weights",
@@ -114,12 +130,14 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
     )
 
     runs: List[RunConfig] = []
-    for idx, mass_file in enumerate(mass_files):
+    for idx, mass_group in enumerate(run_input_groups):
+        mass_file = mass_group[0] if len(mass_group) == 1 else ",".join(mass_group)
         runs.append(
             RunConfig(
                 run_index=idx + 1,
                 row_index=1,
                 mass_file=mass_file,
+                mass_files=list(mass_group),
                 params=params,
                 database=database,
                 init_weights=init_weights[idx],
@@ -159,4 +177,3 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
         warnings=warnings,
         runs=runs,
     )
-
