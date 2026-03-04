@@ -1,2 +1,2 @@
 # ProtCosmo
-faster way of searching dark proteins
+faster way of searching dark proteins.
