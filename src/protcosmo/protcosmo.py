@@ -78,10 +78,14 @@ Use --help-full for step-by-step workflow, file-format details, and examples.
 
 SHORT_EPILOG = f"""
 Quick format notes:
+- --mass-file supports: single file, comma list, list file (one path per line), or directory.
+- --params and --database each accept only one value.
 - --novel_protein: FASTA input.
 - --novel_peptide: FASTA or tokenized text (comma/space/tab/newline delimiters).
+- --output_internal_novel_peptide: auto-enabled in novel mode as `--output-dir/protcosmo.internal_novel_peptide.tsv`.
+- --internal_novel_peptide: reuse previously exported internal novel TSV.
+- --stop-after-saving-novel-peptide: stop after TSV export, skip search/scoring in ProtCosmo.
 - --scan/--scan_numbers/--first-scan/--last-scan: only applied when exactly one run is resolved.
-- --input_tsv columns: mass-file, params, database, init-weights, percolator-psms, percolator-peptides.
 
 {ESTIMATION_NOTE}
 """.strip()
@@ -91,17 +95,19 @@ FULL_HELP_TEXT = f"""
 Detailed workflow:
 
 Step 1. Build run configuration
-- Read one or more runs from CLI values and optional --input_tsv.
-- In --input_tsv mode:
-  - ignore blank lines and lines starting with '#'
-  - supported headers: mass-file, params, database, init-weights, percolator-psms, percolator-peptides
-  - underscore aliases also work (example: mass_file, init_weights)
-  - CLI values override TSV values field-by-field for every row
-- Row expansion:
-  - mass-file can contain N comma-separated paths
-  - params/database/init-weights/percolator-psms/percolator-peptides:
-    - 1 value => broadcast to all N mass files
-    - N values => 1:1 mapping with mass files
+- Resolve --mass-file into one or more concrete spectrum files.
+- Supported --mass-file styles:
+  - single mass spectrum file
+  - comma-separated list of files
+  - text file, one mass-file path per line (blank lines and # comments ignored)
+  - directory (all CometPlus-supported files in that directory are used)
+- CometPlus-supported suffixes recognized by ProtCosmo include:
+  .mgf, .mgf.gz, .mzML, .mzML.gz, .mzMLb, .mzXML, .mzXML.gz, .raw, .ms2, .cms2, .bms2
+- Duplicate mass-file paths are de-duplicated while keeping order.
+- --params and --database are required and each accepts only one value.
+- --init-weights/--percolator-psms/--percolator-peptides:
+  - 1 value => broadcast to all resolved mass files
+  - N values => 1:1 mapping with resolved mass-file count
 - Scan-filter gating:
   - --scan/--scan_numbers/--first-scan/--last-scan are applied only when final run count is 1
   - when run count > 1, scan filters are ignored and warning is logged
@@ -110,7 +116,9 @@ Step 2. Run CometPlus for each mass file
 - ProtCosmo builds a CometPlus command with:
   --params, --database, --output_percolatorfile 1, --max_duplicate_proteins -1, --name <run_dir>/comet
 - Optional ProtCosmo-controlled options forwarded to CometPlus:
-  --novel_protein, --novel_peptide, --thread, scan filters (single-run only)
+  --novel_protein, --novel_peptide, --output_internal_novel_peptide,
+  --internal_novel_peptide, --stop-after-saving-novel-peptide,
+  --thread, scan filters (single-run only)
 - Unknown options are passed through to CometPlus unchanged.
 - Each run writes logs to:
   comet_outputs/run_xxxx/cometplus.stdout.log
@@ -171,6 +179,25 @@ Option details and format examples:
 - Parsed examples become:
   PEPTIDEK, PEPTIDEL, ACDEFG, KPEPTIDER
 
+--output_internal_novel_peptide <file>
+- Forwarded directly to CometPlus.
+- CometPlus writes an internal TSV with columns: peptide, peptide_id, protein_id.
+- Default behavior in ProtCosmo:
+  - if --novel_protein or --novel_peptide is provided and this option is not set,
+    ProtCosmo auto-adds:
+    --output_internal_novel_peptide <output-dir>/protcosmo.internal_novel_peptide.tsv
+  - this path is shared across runs, so only one file version is kept.
+
+--internal_novel_peptide <file>
+- Forwarded directly to CometPlus.
+- Reuse a previously exported internal TSV as novel peptide source.
+
+--stop-after-saving-novel-peptide
+- Forwarded directly to CometPlus.
+- CometPlus exits after saving internal TSV.
+- In this mode, ProtCosmo does not run PIN scoring and does not write novel_psms/novel_peptides reports.
+- ProtCosmo still writes run metadata and warnings logs.
+
 --scan <file>
 - Text file of positive scan integers.
 - Delimiters: comma/space/tab/newline.
@@ -200,21 +227,6 @@ Option details and format examples:
 - Expected shape: header row with feature names (must include m0), then numeric rows.
 - ProtCosmo uses numeric rows 1, 3, and 5 for the final score.
 
---input_tsv <file>
-- Optional TSV run table.
-- Ignore blank lines and lines beginning with '#'.
-- Supported columns and meaning:
-  mass-file            mass spectrometry input file(s) for CometPlus
-  params               CometPlus params file(s)
-  database             known database file(s) passed to CometPlus
-  init-weights         Percolator weights file(s) for static scoring
-  percolator-psms      target PSM reference table(s) for q/PEP lookup
-  percolator-peptides  target peptide reference table(s) for q/PEP lookup
-- mass-file may contain comma-separated values in one row.
-- For other columns in that row: use 1 value (broadcast) or N values (1:1 with mass-file count).
-- Underscore aliases are accepted (example: mass_file, init_weights).
-- CLI values override TSV values for each row.
-
 Estimation warning:
 {ESTIMATION_NOTE}
 """.strip()
@@ -243,18 +255,28 @@ def build_parser() -> argparse.ArgumentParser:
     run_group.add_argument(
         "--mass-file",
         dest="mass_file",
-        help="one mass spectrometry file or a comma-separated list",
+        required=True,
+        help=(
+            "mass-file input source.\n"
+            "Supported forms:\n"
+            "  1) one mass spectrum file (e.g. .mgf, .mzML, .mzMLb, .mgf.gz, .mzML.gz)\n"
+            "  2) comma-separated files\n"
+            "  3) text file, one mass-file path per line (# comment lines allowed)\n"
+            "  4) directory; all supported files in that directory are used"
+        ),
     )
     run_group.add_argument(
         "--params",
+        required=True,
         help=(
-            "Comet params file(s): one value (broadcast) or comma-separated list matching --mass-file count"
+            "Comet params file path (required, single value only)."
         ),
     )
     run_group.add_argument(
         "--database",
+        required=True,
         help=(
-            "known database file(s) for CometPlus --database: one value (broadcast) or comma-separated 1:1 list"
+            "known database file path for CometPlus --database (required, single value only)."
         ),
     )
     run_group.add_argument(
@@ -287,6 +309,29 @@ def build_parser() -> argparse.ArgumentParser:
             "  PEPTIDEK,PEPTIDEL\n"
             "  PEPTIDEK PEPTIDEL\n"
             "  one peptide per line is also valid"
+        ),
+    )
+    novel_group.add_argument(
+        "--output_internal_novel_peptide",
+        dest="output_internal_novel_peptide",
+        help=(
+            "forward to CometPlus: export internal novel TSV (columns: peptide, peptide_id, protein_id).\n"
+            "Default (auto-enabled when --novel_protein or --novel_peptide is used):\n"
+            "  <output-dir>/protcosmo.internal_novel_peptide.tsv"
+        ),
+    )
+    novel_group.add_argument(
+        "--internal_novel_peptide",
+        dest="internal_novel_peptide",
+        help="forward to CometPlus: reuse previously exported internal novel TSV input.",
+    )
+    novel_group.add_argument(
+        "--stop-after-saving-novel-peptide",
+        dest="stop_after_saving_novel_peptide",
+        action="store_true",
+        help=(
+            "forward to CometPlus: stop after internal TSV export.\n"
+            "ProtCosmo then skips PIN scoring and only writes run_metadata + warnings logs."
         ),
     )
     novel_group.add_argument(
@@ -354,24 +399,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    parser.add_argument(
-        "--input_tsv",
-        help=(
-            "optional run-input TSV.\n"
-            "Ignore blank lines and lines starting with '#'.\n"
-            "Supported columns:\n"
-            "  mass-file, params, database, init-weights, percolator-psms, percolator-peptides\n"
-            "Underscore aliases are accepted (example: mass_file, init_weights).\n"
-            "Column meaning:\n"
-            "  mass-file: input mass spect file(s)\n"
-            "  params: Comet params file(s)\n"
-            "  database: known database file(s)\n"
-            "  init-weights: Percolator weights for static scoring\n"
-            "  percolator-psms: target PSM reference for q/PEP lookup\n"
-            "  percolator-peptides: target peptide reference for q/PEP lookup\n"
-            "CLI values override TSV values field-by-field."
-        ),
-    )
     return parser
 
 
@@ -589,7 +616,12 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
     command_records: List[dict] = []
 
     for run in config.runs:
-        result = run_cometplus_search(run, config, comet_output_root)
+        result = run_cometplus_search(
+            run,
+            config,
+            comet_output_root,
+            require_pin_output=(not config.stop_after_saving_novel_peptide),
+        )
         command_records.append(
             {
                 "run_index": run.run_index,
@@ -598,12 +630,22 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
                 "command": result.command,
                 "command_shell": _command_to_shell(result.command),
                 "run_dir": str(result.run_dir),
-                "pin_path": str(result.pin_path),
+                "pin_path": None if result.pin_path is None else str(result.pin_path),
                 "stdout_log": str(result.stdout_path),
                 "stderr_log": str(result.stderr_path),
                 "return_code": result.return_code,
             }
         )
+
+        if config.stop_after_saving_novel_peptide:
+            continue
+        if result.pin_path is None:
+            raise RuntimeError(f"Run {run.run_index}: CometPlus PIN output path is missing.")
+        if run.init_weights is None or run.percolator_psms is None or run.percolator_peptides is None:
+            raise RuntimeError(
+                f"Run {run.run_index}: scoring references are missing "
+                "(init-weights/percolator-psms/percolator-peptides)."
+            )
 
         pin_df = read_pin(result.pin_path)
 
@@ -635,6 +677,37 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
         winners["percolator_peptides_file"] = run.percolator_peptides
         winners["protein_ids"] = winners["Proteins"].astype(str).map(split_proteins).map(join_proteins)
         all_winners_parts.append(winners)
+
+    if config.stop_after_saving_novel_peptide:
+        output_paths = {
+            "run_metadata": str(output_dir / "protcosmo.run_metadata.json"),
+            "warnings": str(output_dir / "protcosmo.warnings.log"),
+        }
+        write_warnings(warnings, Path(output_paths["warnings"]))
+        end_time = dt.datetime.now(tz=dt.timezone.utc)
+        metadata = {
+            "start_time_utc": start_time.isoformat(),
+            "end_time_utc": end_time.isoformat(),
+            "duration_seconds": (end_time - start_time).total_seconds(),
+            "argv": sys.argv,
+            "passthrough_args": passthrough_args,
+            "output_dir": str(output_dir),
+            "mode": "stop_after_saving_novel_peptide",
+            "estimation_note": ESTIMATION_NOTE,
+            "use_scan_filters": config.use_scan_filters,
+            "run_count": len(config.runs),
+            "warnings_count": len(warnings),
+            "warnings": warnings,
+            "commands": command_records,
+            "output_paths": output_paths,
+            "all_winners_count": 0,
+            "novel_psm_count": 0,
+            "novel_modified_peptide_count": 0,
+            "novel_unmodified_peptide_count": 0,
+            "novel_protein_count": 0,
+        }
+        write_json(metadata, Path(output_paths["run_metadata"]))
+        return output_paths
 
     all_winners = pd.concat(all_winners_parts, ignore_index=True) if all_winners_parts else pd.DataFrame()
     if all_winners.empty:
@@ -682,7 +755,6 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
         "passthrough_args": passthrough_args,
         "output_dir": str(output_dir),
         "estimation_note": ESTIMATION_NOTE,
-        "input_tsv": None if config.input_tsv is None else str(config.input_tsv),
         "use_scan_filters": config.use_scan_filters,
         "run_count": len(config.runs),
         "warnings_count": len(warnings),
@@ -714,6 +786,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.help_full:
         _print_full_help(parser)
         return 0
+    if any(arg == "--input_tsv" or str(arg).startswith("--input_tsv=") for arg in passthrough_args):
+        print(
+            "ERROR: --input_tsv is no longer supported. "
+            "Use --mass-file with one of: single file, comma list, list file, or directory.",
+            file=sys.stderr,
+        )
+        return 1
     try:
         outputs = run_pipeline(args, passthrough_args)
     except Exception as exc:  # pylint: disable=broad-exception-caught

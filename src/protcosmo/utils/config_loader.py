@@ -2,21 +2,11 @@
 
 from __future__ import annotations
 
-import csv
-import io
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import List, Optional
 
-
-CONFIG_FIELDS = (
-    "mass-file",
-    "params",
-    "database",
-    "init-weights",
-    "percolator-psms",
-    "percolator-peptides",
-)
+from .mass_file_resolver import resolve_mass_files
 
 
 @dataclass
@@ -28,9 +18,9 @@ class RunConfig:
     mass_file: str
     params: str
     database: str
-    init_weights: str
-    percolator_psms: str
-    percolator_peptides: str
+    init_weights: Optional[str]
+    percolator_psms: Optional[str]
+    percolator_peptides: Optional[str]
 
 
 @dataclass
@@ -39,9 +29,11 @@ class PipelineConfig:
 
     cometplus: str
     output_dir: Path
-    input_tsv: Optional[Path]
     novel_protein: Optional[str]
     novel_peptide: Optional[str]
+    output_internal_novel_peptide: Optional[str]
+    internal_novel_peptide: Optional[str]
+    stop_after_saving_novel_peptide: bool
     thread: Optional[int]
     scan: Optional[str]
     scan_numbers: Optional[str]
@@ -62,131 +54,81 @@ def _split_csv(value: Optional[str]) -> List[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
 
 
-def _read_input_tsv(input_tsv: Path) -> List[Dict[str, str]]:
-    lines: List[str] = []
-    with input_tsv.open("r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            if line.lstrip().startswith("#"):
-                continue
-            lines.append(line)
-
-    if not lines:
-        return []
-    reader = csv.DictReader(io.StringIO("".join(lines)), delimiter="\t")
-    rows: List[Dict[str, str]] = []
-    for row in reader:
-        normalized = {str(k).strip(): ("" if v is None else str(v).strip()) for k, v in row.items()}
-        rows.append(normalized)
-    return rows
-
-
-def _resolve_row_value(row: Dict[str, str], field: str) -> Optional[str]:
-    aliases = (field, field.replace("-", "_"))
-    for key in aliases:
-        value = row.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return None
-
-
-def _build_rows(args) -> List[Dict[str, str]]:
-    if args.input_tsv:
-        input_tsv = Path(args.input_tsv)
-        rows = _read_input_tsv(input_tsv)
-        if not rows:
-            raise ValueError(f"--input_tsv has no usable rows: {input_tsv}")
-        return rows
-    return [{}]
-
-
-def _apply_cli_overrides(rows: List[Dict[str, str]], args) -> List[Dict[str, str]]:
-    overrides = {
-        "mass-file": args.mass_file,
-        "params": args.params,
-        "database": args.database,
-        "init-weights": args.init_weights,
-        "percolator-psms": args.percolator_psms,
-        "percolator-peptides": args.percolator_peptides,
-    }
-    updated: List[Dict[str, str]] = []
-    for row in rows:
-        merged = dict(row)
-        for key, value in overrides.items():
-            if value is not None:
-                merged[key] = str(value)
-        updated.append(merged)
-    return updated
-
-
-def _map_field(field_name: str, value: Optional[str], count: int, row_index: int) -> List[str]:
+def _require_single_value(flag: str, value: Optional[str]) -> str:
     values = _split_csv(value)
     if not values:
-        raise ValueError(
-            f"Row {row_index}: missing required value for '{field_name}'."
-        )
+        raise ValueError(f"{flag} is required.")
+    if len(values) != 1:
+        raise ValueError(f"{flag} accepts only one value.")
+    return values[0]
+
+
+def _map_optional_field(
+    flag: str,
+    value: Optional[str],
+    count: int,
+    *,
+    required: bool,
+) -> List[Optional[str]]:
+    values = _split_csv(value)
+    if not values:
+        if required:
+            raise ValueError(f"{flag} is required.")
+        return [None] * count
     if len(values) == 1:
         return values * count
     if len(values) == count:
         return values
     raise ValueError(
-        f"Row {row_index}: '{field_name}' has {len(values)} values but mass-file has {count}. "
+        f"{flag} has {len(values)} values but --mass-file resolved to {count} files. "
         "Allowed: 1 (broadcast) or N (1:1 mapping)."
     )
 
 
-def _expand_runs(rows: Iterable[Dict[str, str]]) -> List[RunConfig]:
-    expanded: List[RunConfig] = []
-    run_index = 0
-    for row_index, row in enumerate(rows, start=1):
-        mass_text = _resolve_row_value(row, "mass-file")
-        mass_files = _split_csv(mass_text)
-        if not mass_files:
-            raise ValueError(f"Row {row_index}: missing required 'mass-file'.")
-
-        count = len(mass_files)
-        params = _map_field("params", _resolve_row_value(row, "params"), count, row_index)
-        database = _map_field("database", _resolve_row_value(row, "database"), count, row_index)
-        init_weights = _map_field("init-weights", _resolve_row_value(row, "init-weights"), count, row_index)
-        psm_refs = _map_field(
-            "percolator-psms",
-            _resolve_row_value(row, "percolator-psms"),
-            count,
-            row_index,
-        )
-        peptide_refs = _map_field(
-            "percolator-peptides",
-            _resolve_row_value(row, "percolator-peptides"),
-            count,
-            row_index,
-        )
-
-        for idx in range(count):
-            run_index += 1
-            expanded.append(
-                RunConfig(
-                    run_index=run_index,
-                    row_index=row_index,
-                    mass_file=mass_files[idx],
-                    params=params[idx],
-                    database=database[idx],
-                    init_weights=init_weights[idx],
-                    percolator_psms=psm_refs[idx],
-                    percolator_peptides=peptide_refs[idx],
-                )
-            )
-    return expanded
-
-
 def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
-    """Create the execution config from CLI and optional input TSV."""
+    """Create the execution config from CLI."""
 
-    rows = _build_rows(args)
-    rows = _apply_cli_overrides(rows, args)
-    runs = _expand_runs(rows)
+    stop_after = bool(getattr(args, "stop_after_saving_novel_peptide", False))
+    mass_files = resolve_mass_files(args.mass_file)
+    params = _require_single_value("--params", args.params)
+    database = _require_single_value("--database", args.database)
+    count = len(mass_files)
+
+    init_weights = _map_optional_field(
+        "--init-weights",
+        args.init_weights,
+        count,
+        required=(not stop_after),
+    )
+    percolator_psms = _map_optional_field(
+        "--percolator-psms",
+        args.percolator_psms,
+        count,
+        required=(not stop_after),
+    )
+    percolator_peptides = _map_optional_field(
+        "--percolator-peptides",
+        args.percolator_peptides,
+        count,
+        required=(not stop_after),
+    )
+
+    runs: List[RunConfig] = []
+    for idx, mass_file in enumerate(mass_files):
+        runs.append(
+            RunConfig(
+                run_index=idx + 1,
+                row_index=1,
+                mass_file=mass_file,
+                params=params,
+                database=database,
+                init_weights=init_weights[idx],
+                percolator_psms=percolator_psms[idx],
+                percolator_peptides=percolator_peptides[idx],
+            )
+        )
+
     warnings: List[str] = []
-
     use_scan_filters = True
     scan_args_present = any(
         x is not None and str(x).strip()
@@ -196,15 +138,17 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
         use_scan_filters = False
         warnings.append(
             "Scan filters (--scan/--scan_numbers/--first-scan/--last-scan) were ignored "
-            "because more than one mass-file was provided."
+            "because --mass-file resolved to more than one input file."
         )
 
     return PipelineConfig(
         cometplus=args.cometplus,
         output_dir=Path(args.output_dir),
-        input_tsv=None if args.input_tsv is None else Path(args.input_tsv),
         novel_protein=args.novel_protein,
         novel_peptide=args.novel_peptide,
+        output_internal_novel_peptide=getattr(args, "output_internal_novel_peptide", None),
+        internal_novel_peptide=getattr(args, "internal_novel_peptide", None),
+        stop_after_saving_novel_peptide=stop_after,
         thread=args.thread,
         scan=args.scan,
         scan_numbers=args.scan_numbers,
@@ -215,3 +159,4 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
         warnings=warnings,
         runs=runs,
     )
+
