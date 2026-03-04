@@ -136,15 +136,15 @@ def build_comet_command(
 def run_cometplus_search(
     run: RunConfig,
     config: PipelineConfig,
-    comet_output_root: Path,
+    output_dir: Path,
     *,
     require_pin_output: bool = True,
 ) -> CometRunResult:
     """Run CometPlus for one mass file and return the generated PIN path."""
 
-    run_dir = comet_output_root / f"run_{run.run_index:04d}"
+    run_dir = output_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    output_base = run_dir / "comet"
+    output_base = (run_dir / f"comet.run_{run.run_index:04d}").resolve()
     command = build_comet_command(run, config, output_base)
     output_internal_target = _resolve_output_internal_target(command, run_dir)
     if output_internal_target is not None and output_internal_target.exists():
@@ -157,8 +157,8 @@ def run_cometplus_search(
         capture_output=True,
         check=False,
     )
-    stdout_path = run_dir / "cometplus.stdout.log"
-    stderr_path = run_dir / "cometplus.stderr.log"
+    stdout_path = run_dir / f"cometplus.run_{run.run_index:04d}.stdout.log"
+    stderr_path = run_dir / f"cometplus.run_{run.run_index:04d}.stderr.log"
     stdout_path.write_text(proc.stdout or "", encoding="utf-8")
     stderr_path.write_text(proc.stderr or "", encoding="utf-8")
 

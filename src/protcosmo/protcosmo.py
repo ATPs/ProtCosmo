@@ -114,15 +114,15 @@ Step 1. Build run configuration
 
 Step 2. Run CometPlus for each mass file
 - ProtCosmo builds a CometPlus command with:
-  --params, --database, --output_percolatorfile 1, --max_duplicate_proteins -1, --name <run_dir>/comet
+  --params, --database, --output_percolatorfile 1, --max_duplicate_proteins -1, --name <output-dir>/comet.run_xxxx
 - Optional ProtCosmo-controlled options forwarded to CometPlus:
   --novel_protein, --novel_peptide, --output_internal_novel_peptide,
   --internal_novel_peptide, --stop-after-saving-novel-peptide,
   --thread, scan filters (single-run only)
 - Unknown options are passed through to CometPlus unchanged.
 - Each run writes logs to:
-  comet_outputs/run_xxxx/cometplus.stdout.log
-  comet_outputs/run_xxxx/cometplus.stderr.log
+  <output-dir>/cometplus.run_xxxx.stdout.log
+  <output-dir>/cometplus.run_xxxx.stderr.log
 - PIN output is detected from generated .pin/.pin.gz/.pin.parquet(.gz)
 
 Step 3. Static scoring from --init-weights
@@ -287,7 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_group.add_argument(
         "--output-dir",
         required=True,
-        help="output directory for reports, metadata, and comet_outputs/run_xxxx logs",
+        help="output directory for reports, metadata, and CometPlus outputs/logs",
     )
 
     novel_group = parser.add_argument_group("Novel and scan-subset inputs")
@@ -605,7 +605,6 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
     start_time = dt.datetime.now(tz=dt.timezone.utc)
     config = load_pipeline_config(args, passthrough_args)
     output_dir = ensure_dir(config.output_dir)
-    comet_output_root = ensure_dir(output_dir / "comet_outputs")
 
     warnings: List[str] = list(config.warnings)
     model_cache: Dict[str, object] = {}
@@ -619,7 +618,7 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
         result = run_cometplus_search(
             run,
             config,
-            comet_output_root,
+            output_dir,
             require_pin_output=(not config.stop_after_saving_novel_peptide),
         )
         command_records.append(
