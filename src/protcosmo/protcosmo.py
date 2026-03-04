@@ -18,6 +18,7 @@ if __package__ in (None, ""):
     _SRC_DIR = _THIS_DIR.parent
     if str(_SRC_DIR) not in sys.path:
         sys.path.insert(0, str(_SRC_DIR))
+    from protcosmo import __version__  # type: ignore
     from protcosmo.utils.comet_runner import run_cometplus_search  # type: ignore
     from protcosmo.utils.config_loader import load_pipeline_config  # type: ignore
     from protcosmo.utils.peptide_utils import (  # type: ignore
@@ -42,6 +43,7 @@ if __package__ in (None, ""):
         validate_models_feature_alignment,
     )
 else:
+    from . import __version__
     from .utils.comet_runner import run_cometplus_search
     from .utils.config_loader import load_pipeline_config
     from .utils.peptide_utils import collapse_to_unmodified, normalize_modified_peptide
@@ -92,6 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=ESTIMATION_NOTE,
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--help-full", action="store_true", help="print full help and exit")
     parser.add_argument("--cometplus", default="cometplus", help='path to cometplus executable')
     parser.add_argument(
