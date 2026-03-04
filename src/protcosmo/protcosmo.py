@@ -68,7 +68,7 @@ Detailed behavior:
 3. It selects the best PSM per spectrum.
 4. It marks novel-only winners by protein id prefix COMETPLUS_NOVEL_.
 5. It estimates q-value/PEP from percolator target tables by closest-smaller score mapping.
-6. It writes all winners and novel-only summaries.
+6. It writes novel-only reports and run metadata files.
 
 Scoring:
 1. Use numeric rows 1/3/5 from --init-weights.
@@ -416,7 +416,6 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
     unmodified_summary = _make_unmodified_summary(novel_psms)
     protein_summary = _make_protein_summary(novel_psms)
 
-    all_winners_out = all_winners.copy()
     novel_psms_out = novel_psms.copy()
     if "novel_protein_ids" in novel_psms_out.columns:
         novel_psms_out["novel_protein_ids"] = novel_psms_out["novel_protein_ids"].map(
@@ -424,19 +423,13 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
         )
 
     output_paths = {
-        "all_winners": str(output_dir / "protcosmo.all_winners.tsv"),
         "novel_psms": str(output_dir / "protcosmo.novel_psms.tsv"),
         "novel_peptides_modified": str(output_dir / "protcosmo.novel_peptides.modified.tsv"),
-        "novel_peptides_unmodified": str(output_dir / "protcosmo.novel_peptides.unmodified.tsv"),
-        "novel_proteins": str(output_dir / "protcosmo.novel_proteins.tsv"),
         "run_metadata": str(output_dir / "protcosmo.run_metadata.json"),
         "warnings": str(output_dir / "protcosmo.warnings.log"),
     }
-    write_tsv(all_winners_out, Path(output_paths["all_winners"]))
     write_tsv(novel_psms_out, Path(output_paths["novel_psms"]))
     write_tsv(modified_summary, Path(output_paths["novel_peptides_modified"]))
-    write_tsv(unmodified_summary, Path(output_paths["novel_peptides_unmodified"]))
-    write_tsv(protein_summary, Path(output_paths["novel_proteins"]))
     write_warnings(warnings, Path(output_paths["warnings"]))
 
     end_time = dt.datetime.now(tz=dt.timezone.utc)
