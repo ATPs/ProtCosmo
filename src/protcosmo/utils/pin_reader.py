@@ -5,7 +5,7 @@ from __future__ import annotations
 import gzip
 import re
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Sequence
 
 import pandas as pd
 
@@ -36,18 +36,119 @@ PIN_FEATURE_COLUMNS: List[str] = [
 
 PIN_REQUIRED_COLUMNS: List[str] = [
     "SpecId",
+    "Peptide",
+]
+
+PIN_CANONICAL_COLUMNS: List[str] = [
+    "SpecId",
     "ScanNr",
     "Peptide",
     "Proteins",
+    "Label",
 ] + PIN_FEATURE_COLUMNS
 
+PIN_COLUMN_ALIASES = {
+    "SpecId": (
+        "spec_id",
+        "specid",
+        "spectrumid",
+        "spectrum_id",
+        "psmid",
+        "psm_id",
+    ),
+    "ScanNr": (
+        "scan",
+        "scan_nr",
+        "scan_number",
+        "scannumber",
+        "scanid",
+    ),
+    "Peptide": (
+        "peptide_sequence",
+        "peptidesequence",
+        "modified_peptide",
+        "modifiedpeptide",
+        "sequence",
+    ),
+    "Proteins": (
+        "protein",
+        "protein_id",
+        "protein_ids",
+        "proteinids",
+        "accessions",
+        "proteinaccessions",
+    ),
+    "Label": ("target_decoy_label",),
+    "deltLCn": ("deltalcn", "delta_lcn"),
+    "deltCn": ("deltacn", "delta_cn"),
+    "IonFrac": ("ion_fraction", "ionfraction"),
+    "PepLen": ("pep_len", "peptide_length", "peptidelength"),
+    "lnNumSP": ("ln_num_sp", "lnnumsp"),
+    "dM": ("delta_mass", "deltamass", "dmass", "mass_error"),
+    "absdM": ("abs_delta_mass", "absdeltamass", "abs_dmass", "abs_mass_error"),
+}
+
 _PROTEIN_SPLIT_RE = re.compile(r"[,;\t ]+")
+_NON_ALNUM_RE = re.compile(r"[^0-9a-z]+")
 
 
 def _open_text(path: Path):
     if path.name.endswith(".gz"):
         return gzip.open(path, "rt", encoding="utf-8", newline="")
     return path.open("r", encoding="utf-8", newline="")
+
+
+def _normalize_column_name(name: str) -> str:
+    return _NON_ALNUM_RE.sub("", str(name).strip().lower())
+
+
+def _candidate_column_keys(canonical_name: str) -> set[str]:
+    aliases = set(PIN_COLUMN_ALIASES.get(canonical_name, ()))
+    aliases.add(canonical_name)
+    return {_normalize_column_name(value) for value in aliases if str(value).strip()}
+
+
+def _find_matching_column(columns: Sequence[str], canonical_name: str) -> str | None:
+    if canonical_name in columns:
+        return canonical_name
+    candidate_keys = _candidate_column_keys(canonical_name)
+    for col in columns:
+        if _normalize_column_name(col) in candidate_keys:
+            return col
+    return None
+
+
+def _find_matching_index(columns: Sequence[str], canonical_name: str) -> int:
+    matched = _find_matching_column(columns, canonical_name)
+    if matched is None:
+        return -1
+    for idx, col in enumerate(columns):
+        if col == matched:
+            return idx
+    return -1
+
+
+def _rename_to_canonical_columns(df: pd.DataFrame) -> pd.DataFrame:
+    canonical_targets = PIN_CANONICAL_COLUMNS
+    rename_map = {}
+    used_sources = set()
+    columns = list(df.columns)
+
+    for canonical_name in canonical_targets:
+        if canonical_name in df.columns:
+            continue
+        source_name = _find_matching_column(columns, canonical_name)
+        if source_name is None or source_name in used_sources or source_name == canonical_name:
+            continue
+        rename_map[source_name] = canonical_name
+        used_sources.add(source_name)
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    if "Proteins" not in df.columns:
+        df["Proteins"] = ""
+    return df
 
 
 def _read_pin_text(path: Path) -> pd.DataFrame:
@@ -63,7 +164,7 @@ def _read_pin_text(path: Path) -> pd.DataFrame:
             raise ValueError(f"PIN file is empty: {path}")
 
         header = header_line.split("\t")
-        proteins_idx = header.index("Proteins") if "Proteins" in header else -1
+        proteins_idx = _find_matching_index(header, "Proteins")
         records: List[dict] = []
         for line in handle:
             stripped = line.rstrip("\r\n")
@@ -95,11 +196,21 @@ def _read_pin_text(path: Path) -> pd.DataFrame:
 
 
 def _ensure_columns(df: pd.DataFrame, source_path: Path) -> pd.DataFrame:
+    df = _rename_to_canonical_columns(df)
     missing = [col for col in PIN_REQUIRED_COLUMNS if col not in df.columns]
     if missing:
-        raise ValueError(f"PIN data is missing required columns in {source_path}: {missing}")
-    for col in PIN_FEATURE_COLUMNS + ["ScanNr"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        raise ValueError(
+            f"PIN data is missing required columns in {source_path}: {missing}. "
+            f"Available columns: {list(df.columns)}"
+        )
+    if "Proteins" not in df.columns:
+        df["Proteins"] = ""
+    if "ScanNr" not in df.columns:
+        df["ScanNr"] = pd.Series(range(len(df)), index=df.index, dtype="float64")
+    for col in PIN_FEATURE_COLUMNS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    df["ScanNr"] = pd.to_numeric(df["ScanNr"], errors="coerce").fillna(0.0)
     if "Label" in df.columns:
         df["Label"] = pd.to_numeric(df["Label"], errors="coerce").fillna(0).astype(int)
     df["SpecId"] = df["SpecId"].astype(str)
