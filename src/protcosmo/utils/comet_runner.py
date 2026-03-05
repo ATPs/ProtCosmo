@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import glob
+import gzip
 import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +16,7 @@ from .config_loader import PipelineConfig, RunConfig
 
 
 DEFAULT_INTERNAL_NOVEL_PEPTIDE_FILENAME = "protcosmo.internal_novel_peptide.tsv"
+DEFAULT_NOVEL_PIN_FILENAME_SUFFIX = "cometplus.novel.pin"
 
 
 @dataclass
@@ -54,6 +57,66 @@ def _resolve_output_internal_target(command: List[str], run_dir: Path) -> Option
     else:
         path = path.resolve()
     return path
+
+
+def _is_novel_mode(config: PipelineConfig) -> bool:
+    return any(
+        value is not None and str(value).strip()
+        for value in (
+            config.novel_protein,
+            config.novel_peptide,
+            config.internal_novel_peptide,
+        )
+    )
+
+
+def _rename_if_exists(source: Path, target: Path) -> None:
+    if not source.exists():
+        return
+    if source.resolve() == target.resolve():
+        return
+    if target.exists():
+        target.unlink()
+    source.replace(target)
+
+
+def _rename_cometplus_command_logs(run_dir: Path, output_prefix: str) -> None:
+    for name in ("command.stdout.log", "command.stderr.log"):
+        source = run_dir / name
+        target = run_dir / f"{output_prefix}.{name}"
+        _rename_if_exists(source, target)
+
+
+def _normalize_novel_pin_output(pin_path: Path, run_dir: Path, output_prefix: str) -> Path:
+    target = run_dir / f"{output_prefix}.{DEFAULT_NOVEL_PIN_FILENAME_SUFFIX}"
+    if pin_path.resolve() == target.resolve():
+        return pin_path
+    if target.exists():
+        target.unlink()
+
+    source_name = pin_path.name.lower()
+    if source_name.endswith(".pin"):
+        pin_path.replace(target)
+        return target
+    if source_name.endswith(".pin.gz"):
+        with gzip.open(pin_path, "rt", encoding="utf-8", newline="") as src, target.open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        ) as dst:
+            shutil.copyfileobj(src, dst)
+        pin_path.unlink()
+        return target
+    if source_name.endswith(".parquet") or source_name.endswith(".parquet.gz"):
+        import pandas as pd
+
+        frame = pd.read_parquet(pin_path)
+        frame.to_csv(target, sep="\t", index=False)
+        pin_path.unlink()
+        return target
+
+    pin_path.replace(target)
+    return target
 
 
 def _snapshot_pin_mtime(run_dir: Path) -> dict[str, float]:
@@ -117,7 +180,7 @@ def build_comet_command(
         command.extend(["--novel_peptide", _resolve_arg_path(config.novel_peptide)])
     output_internal_novel = config.output_internal_novel_peptide
     if output_internal_novel is None and (config.novel_protein or config.novel_peptide):
-        output_internal_novel = str((config.output_dir / DEFAULT_INTERNAL_NOVEL_PEPTIDE_FILENAME).resolve())
+        output_internal_novel = str((config.output_dir / f"{config.output_prefix}.internal_novel_peptide.tsv").resolve())
     if output_internal_novel:
         command.extend(
             [
@@ -163,6 +226,9 @@ def run_cometplus_search(
     run_dir = output_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     command = build_comet_command(run, config)
+    novel_pin_target = run_dir / f"{config.output_prefix}.{DEFAULT_NOVEL_PIN_FILENAME_SUFFIX}"
+    if _is_novel_mode(config) and novel_pin_target.exists():
+        novel_pin_target.unlink()
     before_pin_snapshot = _snapshot_pin_mtime(run_dir)
     output_internal_target = _resolve_output_internal_target(command, run_dir)
     if output_internal_target is not None and output_internal_target.exists():
@@ -175,10 +241,11 @@ def run_cometplus_search(
         capture_output=True,
         check=False,
     )
-    stdout_path = run_dir / f"cometplus.run_{run.run_index:04d}.stdout.log"
-    stderr_path = run_dir / f"cometplus.run_{run.run_index:04d}.stderr.log"
+    stdout_path = run_dir / f"{config.output_prefix}.cometplus.run_{run.run_index:04d}.stdout.log"
+    stderr_path = run_dir / f"{config.output_prefix}.cometplus.run_{run.run_index:04d}.stderr.log"
     stdout_path.write_text(proc.stdout or "", encoding="utf-8")
     stderr_path.write_text(proc.stderr or "", encoding="utf-8")
+    _rename_cometplus_command_logs(run_dir, config.output_prefix)
 
     if proc.returncode != 0:
         pretty = " ".join(shlex.quote(token) for token in command)
@@ -189,6 +256,8 @@ def run_cometplus_search(
         )
 
     pin_path = _find_pin_output(run_dir, before_pin_snapshot) if require_pin_output else None
+    if pin_path is not None and _is_novel_mode(config):
+        pin_path = _normalize_novel_pin_output(pin_path, run_dir, config.output_prefix)
     return CometRunResult(
         run_dir=run_dir,
         command=command,

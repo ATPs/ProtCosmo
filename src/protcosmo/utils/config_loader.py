@@ -30,11 +30,14 @@ class PipelineConfig:
 
     cometplus: str
     output_dir: Path
+    output_prefix: str
     novel_protein: Optional[str]
     novel_peptide: Optional[str]
     output_internal_novel_peptide: Optional[str]
     internal_novel_peptide: Optional[str]
     stop_after_saving_novel_peptide: bool
+    stop_after_cometplus: bool
+    input_pin: Optional[str]
     keep_tmp: bool
     run_comet_each: bool
     thread: Optional[int]
@@ -92,7 +95,73 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
     """Create the execution config from CLI."""
 
     stop_after = bool(getattr(args, "stop_after_saving_novel_peptide", False))
-    mass_files = resolve_mass_files(args.mass_file)
+    stop_after_cometplus = bool(getattr(args, "stop_after_cometplus", False))
+    input_pin_value = getattr(args, "input_pin", None)
+    input_pin = str(input_pin_value).strip() if input_pin_value is not None else ""
+    if not input_pin:
+        input_pin = None
+    output_prefix = str(getattr(args, "output_prefix", "protcosmo")).strip()
+    if not output_prefix:
+        raise ValueError("--output-prefix cannot be empty.")
+
+    if stop_after and stop_after_cometplus:
+        raise ValueError("--stop-after-saving-novel-peptide and --stop-after-cometplus cannot be used together.")
+    if input_pin and stop_after:
+        raise ValueError("--stop-after-saving-novel-peptide cannot be used with --input-pin.")
+    if input_pin and stop_after_cometplus:
+        raise ValueError("--stop-after-cometplus cannot be used with --input-pin.")
+
+    if input_pin:
+        resolved_pin = str(Path(_require_single_value("--input-pin", input_pin)).expanduser().resolve())
+        init_weights = _map_optional_field("--init-weights", args.init_weights, 1, required=True)
+        percolator_psms = _map_optional_field("--percolator-psms", args.percolator_psms, 1, required=True)
+        percolator_peptides = _map_optional_field(
+            "--percolator-peptides",
+            args.percolator_peptides,
+            1,
+            required=True,
+        )
+        runs = [
+            RunConfig(
+                run_index=1,
+                row_index=1,
+                mass_file=resolved_pin,
+                mass_files=[resolved_pin],
+                params="",
+                database="",
+                init_weights=init_weights[0],
+                percolator_psms=percolator_psms[0],
+                percolator_peptides=percolator_peptides[0],
+            )
+        ]
+        return PipelineConfig(
+            cometplus=args.cometplus,
+            output_dir=Path(args.output_dir),
+            output_prefix=output_prefix,
+            novel_protein=args.novel_protein,
+            novel_peptide=args.novel_peptide,
+            output_internal_novel_peptide=getattr(args, "output_internal_novel_peptide", None),
+            internal_novel_peptide=getattr(args, "internal_novel_peptide", None),
+            stop_after_saving_novel_peptide=False,
+            stop_after_cometplus=False,
+            input_pin=resolved_pin,
+            keep_tmp=bool(getattr(args, "keep_tmp", False)),
+            run_comet_each=bool(getattr(args, "run_comet_each", True)),
+            thread=args.thread,
+            scan=args.scan,
+            scan_numbers=args.scan_numbers,
+            first_scan=args.first_scan,
+            last_scan=args.last_scan,
+            passthrough_args=list(passthrough_args),
+            use_scan_filters=False,
+            warnings=[],
+            runs=runs,
+        )
+
+    mass_file = getattr(args, "mass_file", None)
+    if mass_file is None or not str(mass_file).strip():
+        raise ValueError("--mass-file is required unless --input-pin is set.")
+    mass_files = resolve_mass_files(mass_file)
     novel_mode = any(
         x is not None and str(x).strip()
         for x in (
@@ -112,23 +181,14 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
     database = _require_single_value("--database", args.database)
     count = len(run_input_groups)
 
-    init_weights = _map_optional_field(
-        "--init-weights",
-        args.init_weights,
-        count,
-        required=(not stop_after),
-    )
-    percolator_psms = _map_optional_field(
-        "--percolator-psms",
-        args.percolator_psms,
-        count,
-        required=(not stop_after),
-    )
+    score_required = (not stop_after) and (not stop_after_cometplus)
+    init_weights = _map_optional_field("--init-weights", args.init_weights, count, required=score_required)
+    percolator_psms = _map_optional_field("--percolator-psms", args.percolator_psms, count, required=score_required)
     percolator_peptides = _map_optional_field(
         "--percolator-peptides",
         args.percolator_peptides,
         count,
-        required=(not stop_after),
+        required=score_required,
     )
 
     runs: List[RunConfig] = []
@@ -164,11 +224,14 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
     return PipelineConfig(
         cometplus=args.cometplus,
         output_dir=Path(args.output_dir),
+        output_prefix=output_prefix,
         novel_protein=args.novel_protein,
         novel_peptide=args.novel_peptide,
         output_internal_novel_peptide=getattr(args, "output_internal_novel_peptide", None),
         internal_novel_peptide=getattr(args, "internal_novel_peptide", None),
         stop_after_saving_novel_peptide=stop_after,
+        stop_after_cometplus=stop_after_cometplus,
+        input_pin=None,
         keep_tmp=bool(getattr(args, "keep_tmp", False)),
         run_comet_each=bool(getattr(args, "run_comet_each", True)),
         thread=args.thread,

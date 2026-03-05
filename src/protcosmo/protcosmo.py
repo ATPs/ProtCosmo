@@ -78,11 +78,13 @@ Use --help-full for step-by-step workflow, file-format details, and examples.
 
 SHORT_EPILOG = f"""
 Quick format notes:
+- --input-pin: skip CometPlus and score directly from this PIN file.
 - --mass-file supports: single file, comma list, list file (one path per line), or directory.
-- --params and --database each accept only one value.
+- --params and --database each accept only one value (required unless --input-pin is set).
 - --output-dir is also forwarded to CometPlus as --output-folder.
 - --output-prefix controls ProtCosmo-generated output filename prefix (default: protcosmo).
 - --run-comet-each is forwarded to CometPlus by default.
+- --stop-after-cometplus: run CometPlus then stop (no scoring/reporting).
 - --novel_protein: FASTA input.
 - --novel_peptide: FASTA or tokenized text (comma/space/tab/newline delimiters).
 - --output_internal_novel_peptide: auto-enabled in novel mode as `--output-dir/<output-prefix>.internal_novel_peptide.tsv`.
@@ -99,6 +101,9 @@ FULL_HELP_TEXT = f"""
 Detailed workflow:
 
 Step 1. Build run configuration
+- If --input-pin is provided:
+  - ProtCosmo skips CometPlus and scores this PIN directly.
+  - --mass-file/--params/--database are not required.
 - Resolve --mass-file into one or more concrete spectrum files.
 - Supported --mass-file styles:
   - single mass spectrum file
@@ -108,7 +113,7 @@ Step 1. Build run configuration
 - CometPlus-supported suffixes recognized by ProtCosmo include:
   .mgf, .mgf.gz, .mzML, .mzML.gz, .mzMLb, .mzXML, .mzXML.gz, .raw, .ms2, .cms2, .bms2
 - Duplicate mass-file paths are de-duplicated while keeping order.
-- --params and --database are required and each accepts only one value.
+- --params and --database are required and each accepts only one value (unless --input-pin is set).
 - --init-weights/--percolator-psms/--percolator-peptides:
   - 1 value => broadcast to all resolved mass files
   - N values => 1:1 mapping with resolved mass-file count
@@ -129,9 +134,10 @@ Step 2. Run CometPlus for each mass file
   --keep-tmp, --run-comet-each, --thread, scan filters (single-run only)
 - Unknown options are passed through to CometPlus unchanged.
 - Each run writes logs to:
-  <output-dir>/cometplus.run_xxxx.stdout.log
-  <output-dir>/cometplus.run_xxxx.stderr.log
+  <output-dir>/<output-prefix>.cometplus.run_xxxx.stdout.log
+  <output-dir>/<output-prefix>.cometplus.run_xxxx.stderr.log
 - PIN output is detected from generated .pin/.pin.gz/.pin.parquet(.gz)
+- With --stop-after-cometplus, ProtCosmo stops after this step and writes only metadata + warnings logs.
 
 Step 3. Static scoring from --init-weights
 - --init-weights is a Percolator weights file used for re-scoring PIN candidates.
@@ -244,6 +250,15 @@ Option details and format examples:
 - Expected shape: header row with feature names (must include m0), then numeric rows.
 - ProtCosmo uses numeric rows 1, 3, and 5 for the final score.
 
+--input-pin <file>
+- Skip CometPlus and directly score this PIN.
+- Requires: --init-weights, --percolator-psms, --percolator-peptides.
+- --mass-file/--params/--database are not required in this mode.
+
+--stop-after-cometplus
+- Run CometPlus and stop before scoring.
+- ProtCosmo writes run metadata and warnings logs only.
+
 Estimation warning:
 {ESTIMATION_NOTE}
 """.strip()
@@ -272,28 +287,36 @@ def build_parser() -> argparse.ArgumentParser:
     run_group.add_argument(
         "--mass-file",
         dest="mass_file",
-        required=True,
         help=(
             "mass-file input source.\n"
             "Supported forms:\n"
             "  1) one mass spectrum file (e.g. .mgf, .mzML, .mzMLb, .mgf.gz, .mzML.gz)\n"
             "  2) comma-separated files\n"
             "  3) text file, one mass-file path per line (# comment lines allowed)\n"
-            "  4) directory; all supported files in that directory are used"
+            "  4) directory; all supported files in that directory are used\n"
+            "Required unless --input-pin is set."
         ),
     )
     run_group.add_argument(
         "--params",
-        required=True,
         help=(
-            "Comet params file path (required, single value only)."
+            "Comet params file path (single value only).\n"
+            "Required unless --input-pin is set."
         ),
     )
     run_group.add_argument(
         "--database",
-        required=True,
         help=(
-            "known database file path for CometPlus --database (required, single value only)."
+            "known database file path for CometPlus --database (single value only).\n"
+            "Required unless --input-pin is set."
+        ),
+    )
+    run_group.add_argument(
+        "--input-pin",
+        dest="input_pin",
+        help=(
+            "skip CometPlus and directly score this PIN file.\n"
+            "In this mode, --mass-file/--params/--database are not required."
         ),
     )
     run_group.add_argument(
@@ -332,6 +355,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-prefix",
         default="protcosmo",
         help="filename prefix for ProtCosmo outputs (default: protcosmo)",
+    )
+    run_group.add_argument(
+        "--stop-after-cometplus",
+        dest="stop_after_cometplus",
+        action="store_true",
+        help="run CometPlus and stop before scoring; only write run_metadata + warnings logs",
     )
 
     novel_group = parser.add_argument_group("Novel and scan-subset inputs")
@@ -645,15 +674,56 @@ def _make_protein_summary(novel_psms: pd.DataFrame) -> pd.DataFrame:
     return summary.loc[:, keep_cols]
 
 
+def _score_winner_rows_from_pin(
+    run,
+    pin_path: Path,
+    model_cache: Dict[str, object],
+    psm_lookup_cache: Dict[str, object],
+    warnings: List[str],
+) -> pd.DataFrame:
+    if run.init_weights is None or run.percolator_psms is None or run.percolator_peptides is None:
+        raise RuntimeError(
+            f"Run {run.run_index}: scoring references are missing "
+            "(init-weights/percolator-psms/percolator-peptides)."
+        )
+
+    pin_df = read_pin(pin_path)
+
+    models = _lookup_cache_get(model_cache, run.init_weights, parse_selected_models)
+    validate_models_feature_alignment(models)
+    scored = score_pin_candidates(pin_df, models)
+    winners = select_best_psm_per_spectrum(scored, run.mass_file)
+
+    psm_lookup = _lookup_cache_get(psm_lookup_cache, run.percolator_psms, build_reference_lookup)
+    psm_scores = winners["final_score"].to_numpy(dtype=np.float64, copy=False)
+    est_q, est_pep, matched, fallback = psm_lookup.estimate_array(psm_scores)
+    fallback_count = int(np.count_nonzero(fallback))
+    if fallback_count > 0:
+        warnings.append(
+            f"Run {run.run_index}: {fallback_count} winner PSM(s) had no smaller score in "
+            f"reference {run.percolator_psms}; assigned q-value=1 and PEP=1."
+        )
+
+    winners["estimated_psm_q_value"] = est_q
+    winners["estimated_psm_pep"] = est_pep
+    winners["estimated_psm_matched_score"] = matched
+    winners["estimated_psm_fallback"] = fallback
+    winners["run_index"] = run.run_index
+    winners["row_index"] = run.row_index
+    winners["params_file"] = run.params
+    winners["database_file"] = run.database
+    winners["init_weights_file"] = run.init_weights
+    winners["percolator_psms_file"] = run.percolator_psms
+    winners["percolator_peptides_file"] = run.percolator_peptides
+    winners["protein_ids"] = winners["Proteins"].astype(str).map(split_proteins).map(join_proteins)
+    return winners
+
+
 def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
     start_time = dt.datetime.now(tz=dt.timezone.utc)
     config = load_pipeline_config(args, passthrough_args)
-    output_prefix = str(getattr(args, "output_prefix", "protcosmo")).strip()
-    if not output_prefix:
-        raise ValueError("--output-prefix cannot be empty.")
+    output_prefix = config.output_prefix
     output_dir = ensure_dir(config.output_dir)
-    if config.output_internal_novel_peptide is None and (config.novel_protein or config.novel_peptide):
-        config.output_internal_novel_peptide = str((output_dir / f"{output_prefix}.internal_novel_peptide.tsv").resolve())
 
     warnings: List[str] = list(config.warnings)
     model_cache: Dict[str, object] = {}
@@ -662,71 +732,56 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
 
     all_winners_parts: List[pd.DataFrame] = []
     command_records: List[dict] = []
+    stop_after_any = config.stop_after_saving_novel_peptide or config.stop_after_cometplus
 
-    for run in config.runs:
-        result = run_cometplus_search(
-            run,
-            config,
-            output_dir,
-            require_pin_output=(not config.stop_after_saving_novel_peptide),
-        )
-        command_records.append(
-            {
-                "run_index": run.run_index,
-                "row_index": run.row_index,
-                "mass_file": run.mass_file,
-                "command": result.command,
-                "command_shell": _command_to_shell(result.command),
-                "run_dir": str(result.run_dir),
-                "pin_path": None if result.pin_path is None else str(result.pin_path),
-                "stdout_log": str(result.stdout_path),
-                "stderr_log": str(result.stderr_path),
-                "return_code": result.return_code,
-            }
-        )
-
-        if config.stop_after_saving_novel_peptide:
-            continue
-        if result.pin_path is None:
-            raise RuntimeError(f"Run {run.run_index}: CometPlus PIN output path is missing.")
-        if run.init_weights is None or run.percolator_psms is None or run.percolator_peptides is None:
-            raise RuntimeError(
-                f"Run {run.run_index}: scoring references are missing "
-                "(init-weights/percolator-psms/percolator-peptides)."
+    if config.input_pin:
+        for run in config.runs:
+            winners = _score_winner_rows_from_pin(
+                run=run,
+                pin_path=Path(run.mass_file),
+                model_cache=model_cache,
+                psm_lookup_cache=psm_lookup_cache,
+                warnings=warnings,
+            )
+            all_winners_parts.append(winners)
+    else:
+        for run in config.runs:
+            result = run_cometplus_search(
+                run,
+                config,
+                output_dir,
+                require_pin_output=(not stop_after_any),
+            )
+            command_records.append(
+                {
+                    "run_index": run.run_index,
+                    "row_index": run.row_index,
+                    "mass_file": run.mass_file,
+                    "command": result.command,
+                    "command_shell": _command_to_shell(result.command),
+                    "run_dir": str(result.run_dir),
+                    "pin_path": None if result.pin_path is None else str(result.pin_path),
+                    "stdout_log": str(result.stdout_path),
+                    "stderr_log": str(result.stderr_path),
+                    "return_code": result.return_code,
+                }
             )
 
-        pin_df = read_pin(result.pin_path)
-
-        models = _lookup_cache_get(model_cache, run.init_weights, parse_selected_models)
-        validate_models_feature_alignment(models)
-        scored = score_pin_candidates(pin_df, models)
-        winners = select_best_psm_per_spectrum(scored, run.mass_file)
-
-        psm_lookup = _lookup_cache_get(psm_lookup_cache, run.percolator_psms, build_reference_lookup)
-        psm_scores = winners["final_score"].to_numpy(dtype=np.float64, copy=False)
-        est_q, est_pep, matched, fallback = psm_lookup.estimate_array(psm_scores)
-        fallback_count = int(np.count_nonzero(fallback))
-        if fallback_count > 0:
-            warnings.append(
-                f"Run {run.run_index}: {fallback_count} winner PSM(s) had no smaller score in "
-                f"reference {run.percolator_psms}; assigned q-value=1 and PEP=1."
+            if stop_after_any:
+                continue
+            if result.pin_path is None:
+                raise RuntimeError(f"Run {run.run_index}: CometPlus PIN output path is missing.")
+            winners = _score_winner_rows_from_pin(
+                run=run,
+                pin_path=result.pin_path,
+                model_cache=model_cache,
+                psm_lookup_cache=psm_lookup_cache,
+                warnings=warnings,
             )
+            all_winners_parts.append(winners)
 
-        winners["estimated_psm_q_value"] = est_q
-        winners["estimated_psm_pep"] = est_pep
-        winners["estimated_psm_matched_score"] = matched
-        winners["estimated_psm_fallback"] = fallback
-        winners["run_index"] = run.run_index
-        winners["row_index"] = run.row_index
-        winners["params_file"] = run.params
-        winners["database_file"] = run.database
-        winners["init_weights_file"] = run.init_weights
-        winners["percolator_psms_file"] = run.percolator_psms
-        winners["percolator_peptides_file"] = run.percolator_peptides
-        winners["protein_ids"] = winners["Proteins"].astype(str).map(split_proteins).map(join_proteins)
-        all_winners_parts.append(winners)
-
-    if config.stop_after_saving_novel_peptide:
+    if stop_after_any:
+        mode = "stop_after_cometplus" if config.stop_after_cometplus else "stop_after_saving_novel_peptide"
         output_paths = {
             "run_metadata": str(output_dir / f"{output_prefix}.run_metadata.json"),
             "warnings": str(output_dir / f"{output_prefix}.warnings.log"),
@@ -741,7 +796,8 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
             "passthrough_args": passthrough_args,
             "output_dir": str(output_dir),
             "output_prefix": output_prefix,
-            "mode": "stop_after_saving_novel_peptide",
+            "mode": mode,
+            "input_pin": config.input_pin,
             "estimation_note": ESTIMATION_NOTE,
             "use_scan_filters": config.use_scan_filters,
             "run_count": len(config.runs),
@@ -804,6 +860,7 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
         "passthrough_args": passthrough_args,
         "output_dir": str(output_dir),
         "output_prefix": output_prefix,
+        "input_pin": config.input_pin,
         "estimation_note": ESTIMATION_NOTE,
         "use_scan_filters": config.use_scan_filters,
         "run_count": len(config.runs),
