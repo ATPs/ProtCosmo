@@ -26,9 +26,11 @@ class CometRunResult:
     run_dir: Path
     command: List[str]
     return_code: int
-    stdout_path: Path
-    stderr_path: Path
+    stdout_text: str
+    stderr_text: str
     pin_path: Optional[Path]
+    skipped: bool
+    overwrote_existing_pin: bool
 
 
 def _resolve_arg_path(value: str) -> str:
@@ -227,8 +229,21 @@ def run_cometplus_search(
     run_dir.mkdir(parents=True, exist_ok=True)
     command = build_comet_command(run, config)
     novel_pin_target = run_dir / f"{config.output_prefix}.{DEFAULT_NOVEL_PIN_FILENAME_SUFFIX}"
-    if _is_novel_mode(config) and novel_pin_target.exists():
+    overwrote_existing_pin = False
+    if require_pin_output and _is_novel_mode(config) and novel_pin_target.exists():
+        if not config.force:
+            return CometRunResult(
+                run_dir=run_dir,
+                command=command,
+                return_code=0,
+                stdout_text="",
+                stderr_text="",
+                pin_path=novel_pin_target.resolve(),
+                skipped=True,
+                overwrote_existing_pin=False,
+            )
         novel_pin_target.unlink()
+        overwrote_existing_pin = True
     before_pin_snapshot = _snapshot_pin_mtime(run_dir)
     output_internal_target = _resolve_output_internal_target(command, run_dir)
     if output_internal_target is not None and output_internal_target.exists():
@@ -241,18 +256,17 @@ def run_cometplus_search(
         capture_output=True,
         check=False,
     )
-    stdout_path = run_dir / f"{config.output_prefix}.cometplus.run_{run.run_index:04d}.stdout.log"
-    stderr_path = run_dir / f"{config.output_prefix}.cometplus.run_{run.run_index:04d}.stderr.log"
-    stdout_path.write_text(proc.stdout or "", encoding="utf-8")
-    stderr_path.write_text(proc.stderr or "", encoding="utf-8")
     _rename_cometplus_command_logs(run_dir, config.output_prefix)
 
     if proc.returncode != 0:
         pretty = " ".join(shlex.quote(token) for token in command)
+        stdout_tail = (proc.stdout or "")[-2000:]
+        stderr_tail = (proc.stderr or "")[-2000:]
         raise RuntimeError(
             f"CometPlus failed for mass file {run.mass_file} with exit code {proc.returncode}.\n"
             f"Command: {pretty}\n"
-            f"See logs:\n  stdout: {stdout_path}\n  stderr: {stderr_path}"
+            f"Captured stdout (tail):\n{stdout_tail}\n"
+            f"Captured stderr (tail):\n{stderr_tail}"
         )
 
     pin_path = _find_pin_output(run_dir, before_pin_snapshot) if require_pin_output else None
@@ -262,7 +276,9 @@ def run_cometplus_search(
         run_dir=run_dir,
         command=command,
         return_code=proc.returncode,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
+        stdout_text=proc.stdout or "",
+        stderr_text=proc.stderr or "",
         pin_path=pin_path,
+        skipped=False,
+        overwrote_existing_pin=overwrote_existing_pin,
     )

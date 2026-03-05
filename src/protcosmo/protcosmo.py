@@ -4,11 +4,9 @@
 from __future__ import annotations
 
 import argparse
-import datetime as dt
-import shlex
 import sys
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence, TextIO
 
 import numpy as np
 import pandas as pd
@@ -29,9 +27,7 @@ if __package__ in (None, ""):
     from protcosmo.utils.pin_reader import read_pin, split_proteins  # type: ignore
     from protcosmo.utils.report_writer import (  # type: ignore
         ensure_dir,
-        write_json,
         write_tsv,
-        write_warnings,
     )
     from protcosmo.utils.scoring import score_pin_candidates  # type: ignore
     from protcosmo.utils.selection import (  # type: ignore
@@ -49,7 +45,7 @@ else:
     from .utils.peptide_utils import collapse_to_unmodified, normalize_modified_peptide
     from .utils.percolator_ref import build_partitioned_reference_lookup
     from .utils.pin_reader import read_pin, split_proteins
-    from .utils.report_writer import ensure_dir, write_json, write_tsv, write_warnings
+    from .utils.report_writer import ensure_dir, write_tsv
     from .utils.scoring import score_pin_candidates
     from .utils.selection import get_novel_protein_ids, select_best_psm_per_spectrum
     from .utils.weights_parser import parse_selected_models, validate_models_feature_alignment
@@ -83,6 +79,8 @@ Quick format notes:
 - --params and --database each accept only one value (required unless --input-pin is set).
 - --output-dir is also forwarded to CometPlus as --output-folder.
 - --output-prefix controls ProtCosmo-generated output filename prefix (default: protcosmo).
+- --log: also write runtime logs/warnings to <output-dir>/<output-prefix>.log.
+- --force: overwrite existing <output-prefix>.cometplus.novel.pin in novel mode.
 - --run-comet-each is forwarded to CometPlus by default.
 - --stop-after-cometplus: run CometPlus then stop (no scoring/reporting).
 - --novel_protein: FASTA input.
@@ -133,11 +131,12 @@ Step 2. Run CometPlus for each mass file
   --internal_novel_peptide, --stop-after-saving-novel-peptide,
   --keep-tmp, --run-comet-each, --thread, scan filters (single-run only)
 - Unknown options are passed through to CometPlus unchanged.
-- Each run writes logs to:
-  <output-dir>/<output-prefix>.cometplus.run_xxxx.stdout.log
-  <output-dir>/<output-prefix>.cometplus.run_xxxx.stderr.log
+- CometPlus stdout/stderr are streamed to screen (and to <output-prefix>.log when --log is set).
 - PIN output is detected from generated .pin/.pin.gz/.pin.parquet(.gz)
-- With --stop-after-cometplus, ProtCosmo stops after this step and writes only metadata + warnings logs.
+- In novel mode, if <output-prefix>.cometplus.novel.pin already exists:
+  - default: skip CometPlus and reuse this PIN
+  - with --force: rerun CometPlus and overwrite it
+- With --stop-after-cometplus, ProtCosmo stops after this step.
 
 Step 3. Static scoring from --init-weights
 - --init-weights is a Percolator weights file used for re-scoring PIN candidates.
@@ -165,8 +164,7 @@ Step 5. Estimate q-value/PEP by lookup
 Step 6. Write outputs
 - <output-prefix>.nove.psms.tsv
 - <output-prefix>.novel.peptides.tsv
-- <output-prefix>.warnings.log
-- <output-prefix>.run_metadata.json
+- optional: <output-prefix>.log (when --log is set)
 
 Option details and format examples:
 
@@ -211,7 +209,7 @@ Option details and format examples:
 - Forwarded directly to CometPlus.
 - CometPlus exits after saving internal TSV.
 - In this mode, ProtCosmo does not run PIN scoring and does not write novel_psms/novel_peptides reports.
-- ProtCosmo still writes run metadata and warnings logs.
+- ProtCosmo still prints runtime logs/warnings to screen.
 
 --keep-tmp
 - Forwarded directly to CometPlus.
@@ -258,7 +256,16 @@ Option details and format examples:
 
 --stop-after-cometplus
 - Run CometPlus and stop before scoring.
-- ProtCosmo writes run metadata and warnings logs only.
+- ProtCosmo prints runtime logs/warnings to screen and exits.
+
+--force
+- In novel mode, if `<output-prefix>.cometplus.novel.pin` already exists:
+  - default behavior is skip/reuse;
+  - with `--force`, ProtCosmo reruns CometPlus and overwrites that PIN.
+
+--log
+- Also write runtime logs/warnings to:
+  `<output-dir>/<output-prefix>.log`
 
 Estimation warning:
 {ESTIMATION_NOTE}
@@ -348,7 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         required=True,
         help=(
-            "output directory for reports, metadata, and CometPlus outputs/logs.\n"
+            "output directory for reports and CometPlus outputs/logs.\n"
             "Also forwarded to CometPlus as --output-folder."
         ),
     )
@@ -361,7 +368,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--stop-after-cometplus",
         dest="stop_after_cometplus",
         action="store_true",
-        help="run CometPlus and stop before scoring; only write run_metadata + warnings logs",
+        help="run CometPlus and stop before scoring",
+    )
+    run_group.add_argument(
+        "--force",
+        action="store_true",
+        help="in novel mode, rerun and overwrite existing <output-prefix>.cometplus.novel.pin",
+    )
+    run_group.add_argument(
+        "--log",
+        action="store_true",
+        help="also write runtime logs/warnings to <output-dir>/<output-prefix>.log",
     )
 
     novel_group = parser.add_argument_group("Novel and scan-subset inputs")
@@ -405,7 +422,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "forward to CometPlus: stop after internal TSV export.\n"
-            "ProtCosmo then skips PIN scoring and only writes run_metadata + warnings logs."
+            "ProtCosmo then skips PIN scoring."
         ),
     )
     novel_group.add_argument(
@@ -483,8 +500,37 @@ def _print_full_help(parser: argparse.ArgumentParser) -> None:
     print(FULL_HELP_TEXT)
 
 
-def _command_to_shell(command: Sequence[str]) -> str:
-    return " ".join(shlex.quote(token) for token in command)
+class PipelineLogger:
+    def __init__(self, log_path: Optional[Path]) -> None:
+        self.log_path = log_path
+        self._handle: Optional[TextIO] = None
+        if log_path is not None:
+            ensure_dir(log_path.parent)
+            self._handle = log_path.open("a", encoding="utf-8")
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+    def _emit(self, text: str, stream: TextIO) -> None:
+        if not text:
+            return
+        out = text if text.endswith("\n") else f"{text}\n"
+        stream.write(out)
+        stream.flush()
+        if self._handle is not None:
+            self._handle.write(out)
+            self._handle.flush()
+
+    def info(self, text: str) -> None:
+        self._emit(text, sys.stdout)
+
+    def stderr(self, text: str) -> None:
+        self._emit(text, sys.stderr)
+
+    def warning(self, text: str) -> None:
+        self._emit(f"WARNING: {text}", sys.stderr)
 
 
 def _lookup_cache_get(cache: Dict[str, object], key: str, loader):
@@ -751,157 +797,109 @@ def _score_winner_rows_from_pin(
 
 
 def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
-    start_time = dt.datetime.now(tz=dt.timezone.utc)
     config = load_pipeline_config(args, passthrough_args)
     output_prefix = config.output_prefix
     output_dir = ensure_dir(config.output_dir)
+    log_path = (output_dir / f"{output_prefix}.log").resolve() if config.log else None
+    logger = PipelineLogger(log_path)
+    output_paths: Dict[str, str] = {}
+    if log_path is not None:
+        output_paths["log"] = str(log_path)
 
-    warnings: List[str] = list(config.warnings)
-    model_cache: Dict[str, object] = {}
-    psm_lookup_cache: Dict[str, object] = {}
-    peptide_lookup_cache: Dict[str, object] = {}
+    try:
+        warnings: List[str] = list(config.warnings)
+        model_cache: Dict[str, object] = {}
+        psm_lookup_cache: Dict[str, object] = {}
+        peptide_lookup_cache: Dict[str, object] = {}
+        all_winners_parts: List[pd.DataFrame] = []
+        stop_after_any = config.stop_after_saving_novel_peptide or config.stop_after_cometplus
 
-    all_winners_parts: List[pd.DataFrame] = []
-    command_records: List[dict] = []
-    stop_after_any = config.stop_after_saving_novel_peptide or config.stop_after_cometplus
+        if config.input_pin:
+            for run in config.runs:
+                winners = _score_winner_rows_from_pin(
+                    run=run,
+                    pin_path=Path(run.mass_file),
+                    model_cache=model_cache,
+                    psm_lookup_cache=psm_lookup_cache,
+                    warnings=warnings,
+                )
+                all_winners_parts.append(winners)
+        else:
+            novel_pin_path = (output_dir / f"{output_prefix}.cometplus.novel.pin").resolve()
+            for run in config.runs:
+                result = run_cometplus_search(
+                    run,
+                    config,
+                    output_dir,
+                    require_pin_output=(not stop_after_any),
+                )
+                if result.skipped:
+                    logger.info(
+                        f"Run {run.run_index}: existing PIN found at {result.pin_path}; "
+                        "skipping CometPlus. Use --force to rerun and overwrite."
+                    )
+                else:
+                    if result.overwrote_existing_pin:
+                        logger.info(
+                            f"Run {run.run_index}: --force is set; overwriting existing PIN at {novel_pin_path}."
+                        )
+                    if result.stdout_text:
+                        logger.info(result.stdout_text)
+                    if result.stderr_text:
+                        logger.stderr(result.stderr_text)
 
-    if config.input_pin:
-        for run in config.runs:
-            winners = _score_winner_rows_from_pin(
-                run=run,
-                pin_path=Path(run.mass_file),
-                model_cache=model_cache,
-                psm_lookup_cache=psm_lookup_cache,
-                warnings=warnings,
+                if stop_after_any:
+                    continue
+                if result.pin_path is None:
+                    raise RuntimeError(f"Run {run.run_index}: CometPlus PIN output path is missing.")
+                winners = _score_winner_rows_from_pin(
+                    run=run,
+                    pin_path=result.pin_path,
+                    model_cache=model_cache,
+                    psm_lookup_cache=psm_lookup_cache,
+                    warnings=warnings,
+                )
+                all_winners_parts.append(winners)
+
+        if stop_after_any:
+            for warning in warnings:
+                text = str(warning).strip()
+                if text:
+                    logger.warning(text)
+            return output_paths
+
+        all_winners = pd.concat(all_winners_parts, ignore_index=True) if all_winners_parts else pd.DataFrame()
+        if all_winners.empty:
+            raise RuntimeError("No winner PSMs were produced.")
+
+        novel_psms = all_winners[all_winners["novel_only"]].copy()
+        novel_psms["modified_peptide"] = novel_psms["Peptide"].astype(str).map(normalize_modified_peptide)
+        novel_psms["unmodified_peptide"] = novel_psms["Peptide"].astype(str).map(collapse_to_unmodified)
+        novel_psms["novel_protein_ids"] = novel_psms["Proteins"].astype(str).map(get_novel_protein_ids)
+        novel_psms = _compute_peptide_estimates(novel_psms, peptide_lookup_cache)
+
+        peptide_fallback_count = int(novel_psms["estimated_peptide_fallback"].fillna(False).astype(bool).sum())
+        if peptide_fallback_count > 0:
+            warnings.append(
+                f"{peptide_fallback_count} novel PSM(s) had no smaller score in peptide reference; "
+                "assigned peptide q-value=1 and PEP=1."
             )
-            all_winners_parts.append(winners)
-    else:
-        for run in config.runs:
-            result = run_cometplus_search(
-                run,
-                config,
-                output_dir,
-                require_pin_output=(not stop_after_any),
-            )
-            command_records.append(
-                {
-                    "run_index": run.run_index,
-                    "row_index": run.row_index,
-                    "mass_file": run.mass_file,
-                    "command": result.command,
-                    "command_shell": _command_to_shell(result.command),
-                    "run_dir": str(result.run_dir),
-                    "pin_path": None if result.pin_path is None else str(result.pin_path),
-                    "stdout_log": str(result.stdout_path),
-                    "stderr_log": str(result.stderr_path),
-                    "return_code": result.return_code,
-                }
-            )
 
-            if stop_after_any:
-                continue
-            if result.pin_path is None:
-                raise RuntimeError(f"Run {run.run_index}: CometPlus PIN output path is missing.")
-            winners = _score_winner_rows_from_pin(
-                run=run,
-                pin_path=result.pin_path,
-                model_cache=model_cache,
-                psm_lookup_cache=psm_lookup_cache,
-                warnings=warnings,
-            )
-            all_winners_parts.append(winners)
+        for warning in warnings:
+            text = str(warning).strip()
+            if text:
+                logger.warning(text)
 
-    if stop_after_any:
-        mode = "stop_after_cometplus" if config.stop_after_cometplus else "stop_after_saving_novel_peptide"
-        output_paths = {
-            "run_metadata": str(output_dir / f"{output_prefix}.run_metadata.json"),
-            "warnings": str(output_dir / f"{output_prefix}.warnings.log"),
-        }
-        write_warnings(warnings, Path(output_paths["warnings"]))
-        end_time = dt.datetime.now(tz=dt.timezone.utc)
-        metadata = {
-            "start_time_utc": start_time.isoformat(),
-            "end_time_utc": end_time.isoformat(),
-            "duration_seconds": (end_time - start_time).total_seconds(),
-            "argv": sys.argv,
-            "passthrough_args": passthrough_args,
-            "output_dir": str(output_dir),
-            "output_prefix": output_prefix,
-            "mode": mode,
-            "input_pin": config.input_pin,
-            "estimation_note": ESTIMATION_NOTE,
-            "use_scan_filters": config.use_scan_filters,
-            "run_count": len(config.runs),
-            "warnings_count": len(warnings),
-            "warnings": warnings,
-            "commands": command_records,
-            "output_paths": output_paths,
-            "all_winners_count": 0,
-            "novel_psm_count": 0,
-            "novel_modified_peptide_count": 0,
-            "novel_unmodified_peptide_count": 0,
-            "novel_protein_count": 0,
-        }
-        write_json(metadata, Path(output_paths["run_metadata"]))
+        modified_summary = _make_modified_summary(novel_psms)
+        novel_psms_out = _make_psm_output_table(novel_psms)
+
+        output_paths["novel_psms"] = str((output_dir / f"{output_prefix}.nove.psms.tsv").resolve())
+        output_paths["novel_peptides_modified"] = str((output_dir / f"{output_prefix}.novel.peptides.tsv").resolve())
+        write_tsv(novel_psms_out, Path(output_paths["novel_psms"]))
+        write_tsv(modified_summary, Path(output_paths["novel_peptides_modified"]))
         return output_paths
-
-    all_winners = pd.concat(all_winners_parts, ignore_index=True) if all_winners_parts else pd.DataFrame()
-    if all_winners.empty:
-        raise RuntimeError("No winner PSMs were produced.")
-
-    novel_psms = all_winners[all_winners["novel_only"]].copy()
-    novel_psms["modified_peptide"] = novel_psms["Peptide"].astype(str).map(normalize_modified_peptide)
-    novel_psms["unmodified_peptide"] = novel_psms["Peptide"].astype(str).map(collapse_to_unmodified)
-    novel_psms["novel_protein_ids"] = novel_psms["Proteins"].astype(str).map(get_novel_protein_ids)
-    novel_psms = _compute_peptide_estimates(novel_psms, peptide_lookup_cache)
-
-    peptide_fallback_count = int(novel_psms["estimated_peptide_fallback"].fillna(False).astype(bool).sum())
-    if peptide_fallback_count > 0:
-        warnings.append(
-            f"{peptide_fallback_count} novel PSM(s) had no smaller score in peptide reference; "
-            "assigned peptide q-value=1 and PEP=1."
-        )
-
-    modified_summary = _make_modified_summary(novel_psms)
-    unmodified_summary = _make_unmodified_summary(novel_psms)
-    protein_summary = _make_protein_summary(novel_psms)
-    novel_psms_out = _make_psm_output_table(novel_psms)
-
-    output_paths = {
-        "novel_psms": str(output_dir / f"{output_prefix}.nove.psms.tsv"),
-        "novel_peptides_modified": str(output_dir / f"{output_prefix}.novel.peptides.tsv"),
-        "run_metadata": str(output_dir / f"{output_prefix}.run_metadata.json"),
-        "warnings": str(output_dir / f"{output_prefix}.warnings.log"),
-    }
-    write_tsv(novel_psms_out, Path(output_paths["novel_psms"]))
-    write_tsv(modified_summary, Path(output_paths["novel_peptides_modified"]))
-    write_warnings(warnings, Path(output_paths["warnings"]))
-
-    end_time = dt.datetime.now(tz=dt.timezone.utc)
-    metadata = {
-        "start_time_utc": start_time.isoformat(),
-        "end_time_utc": end_time.isoformat(),
-        "duration_seconds": (end_time - start_time).total_seconds(),
-        "argv": sys.argv,
-        "passthrough_args": passthrough_args,
-        "output_dir": str(output_dir),
-        "output_prefix": output_prefix,
-        "input_pin": config.input_pin,
-        "estimation_note": ESTIMATION_NOTE,
-        "use_scan_filters": config.use_scan_filters,
-        "run_count": len(config.runs),
-        "warnings_count": len(warnings),
-        "warnings": warnings,
-        "commands": command_records,
-        "output_paths": output_paths,
-        "all_winners_count": int(len(all_winners)),
-        "novel_psm_count": int(len(novel_psms)),
-        "novel_modified_peptide_count": int(len(modified_summary)),
-        "novel_unmodified_peptide_count": int(len(unmodified_summary)),
-        "novel_protein_count": int(len(protein_summary)),
-    }
-    write_json(metadata, Path(output_paths["run_metadata"]))
-    return output_paths
+    finally:
+        logger.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

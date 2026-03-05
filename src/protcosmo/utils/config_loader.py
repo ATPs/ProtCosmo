@@ -37,6 +37,8 @@ class PipelineConfig:
     internal_novel_peptide: Optional[str]
     stop_after_saving_novel_peptide: bool
     stop_after_cometplus: bool
+    force: bool
+    log: bool
     input_pin: Optional[str]
     keep_tmp: bool
     run_comet_each: bool
@@ -144,6 +146,8 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
             internal_novel_peptide=getattr(args, "internal_novel_peptide", None),
             stop_after_saving_novel_peptide=False,
             stop_after_cometplus=False,
+            force=bool(getattr(args, "force", False)),
+            log=bool(getattr(args, "log", False)),
             input_pin=resolved_pin,
             keep_tmp=bool(getattr(args, "keep_tmp", False)),
             run_comet_each=bool(getattr(args, "run_comet_each", True)),
@@ -231,6 +235,8 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
         internal_novel_peptide=getattr(args, "internal_novel_peptide", None),
         stop_after_saving_novel_peptide=stop_after,
         stop_after_cometplus=stop_after_cometplus,
+        force=bool(getattr(args, "force", False)),
+        log=bool(getattr(args, "log", False)),
         input_pin=None,
         keep_tmp=bool(getattr(args, "keep_tmp", False)),
         run_comet_each=bool(getattr(args, "run_comet_each", True)),
