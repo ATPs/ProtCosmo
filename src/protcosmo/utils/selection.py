@@ -34,12 +34,19 @@ def classify_novel_only(proteins_text: str) -> bool:
     return all(is_novel_protein_id(token) for token in tokens)
 
 
+def _extract_input_file_key(spec_id: str) -> str:
+    text = str(spec_id)
+    head, sep, _tail = text.partition("_")
+    return head if sep else text
+
+
 def select_best_psm_per_spectrum(scored_df: pd.DataFrame, mass_file: str) -> pd.DataFrame:
     """Select best PSM per spectrum with tie-break preference to non-novel."""
 
     work = scored_df.copy()
     work["mass_file"] = str(mass_file)
     work["spectrum_id"] = work["SpecId"].astype(str).map(extract_spectrum_id)
+    work["input_file_key"] = work["SpecId"].astype(str).map(_extract_input_file_key)
     work["rank_index"] = work["SpecId"].astype(str).map(extract_rank_index)
     work["novel_only"] = work["Proteins"].astype(str).map(classify_novel_only)
     work["novel_protein_ids"] = work["Proteins"].astype(str).map(get_novel_protein_ids)

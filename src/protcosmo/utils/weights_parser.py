@@ -35,12 +35,49 @@ def _is_float_token(token: str) -> bool:
         return False
 
 
+def _select_model_rows(
+    blocks: Sequence[tuple[List[str], Sequence[tuple[List[float], int]]]],
+    source_path: Path,
+) -> List[tuple[List[str], List[float], int]]:
+    """Select three model rows, preferring raw rows in per-bin weight blocks."""
+
+    # Percolator CV export commonly repeats:
+    # header -> normalized row -> raw row
+    # for each bin. In this layout we should use the raw row (second numeric row).
+    selected_by_block: List[tuple[List[str], List[float], int]] = []
+    for header, rows in blocks:
+        if not rows:
+            continue
+        raw_row_pos = 1 if len(rows) >= 2 else 0
+        values, row_index = rows[raw_row_pos]
+        selected_by_block.append((header, values, row_index))
+        if len(selected_by_block) == 3:
+            return selected_by_block
+
+    flat_rows: List[tuple[List[str], List[float], int]] = [
+        (header, values, row_index)
+        for header, rows in blocks
+        for values, row_index in rows
+    ]
+    if len(flat_rows) >= 6:
+        return [flat_rows[1], flat_rows[3], flat_rows[5]]
+    if len(flat_rows) >= 5:
+        return [flat_rows[0], flat_rows[2], flat_rows[4]]
+    if len(flat_rows) >= 3:
+        return flat_rows[:3]
+
+    raise ValueError(
+        f"Weights file has {len(flat_rows)} numeric rows, but 3 model rows are required: {source_path}"
+    )
+
+
 def parse_selected_models(weights_path: str | Path) -> List[LinearModel]:
-    """Parse weights file and select numeric rows 1/3/5."""
+    """Parse weights file and select three models, preferring raw rows (2/4/6)."""
 
     path = Path(weights_path)
     current_header: List[str] | None = None
-    numeric_rows: List[tuple[List[str], List[float], int]] = []
+    current_block_rows: List[tuple[List[float], int]] | None = None
+    blocks: List[tuple[List[str], List[tuple[List[float], int]]]] = []
     numeric_count = 0
 
     with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -52,7 +89,7 @@ def parse_selected_models(weights_path: str | Path) -> List[LinearModel]:
             if not tokens:
                 continue
             if all(_is_float_token(token) for token in tokens):
-                if current_header is None:
+                if current_header is None or current_block_rows is None:
                     raise ValueError(
                         f"Numeric row encountered before header in weights file: {path}"
                     )
@@ -62,19 +99,16 @@ def parse_selected_models(weights_path: str | Path) -> List[LinearModel]:
                         f"in weights file: {path}"
                     )
                 numeric_count += 1
-                numeric_rows.append((current_header, [float(x) for x in tokens], numeric_count))
+                current_block_rows.append(([float(x) for x in tokens], numeric_count))
             else:
                 current_header = tokens
+                current_block_rows = []
+                blocks.append((current_header, current_block_rows))
 
-    required = (1, 3, 5)
-    if len(numeric_rows) < max(required):
-        raise ValueError(
-            f"Weights file has {len(numeric_rows)} numeric rows, but rows 1/3/5 are required: {path}"
-        )
+    selected_rows = _select_model_rows(blocks, path)
 
     models: List[LinearModel] = []
-    for target_row in required:
-        header, values, row_index = numeric_rows[target_row - 1]
+    for header, values, row_index in selected_rows:
         if "m0" not in header:
             raise ValueError(f"Column 'm0' was not found in weights header for row {row_index}: {path}")
         m0_idx = header.index("m0")

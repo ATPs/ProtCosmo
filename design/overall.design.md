@@ -1,218 +1,230 @@
 # ProtCosmo Overall Design
 
-This document describes how ProtCosmo runs internally, step by step, based on the current implementation in:
+This document describes the current runtime design implemented in:
 
 - `src/protcosmo/protcosmo.py`
 - `src/protcosmo/utils/*`
 
 ## 1. Goal
 
-ProtCosmo is a CLI pipeline that:
+ProtCosmo is a CLI pipeline that supports two execution paths:
 
-1. Resolves one or more mass-spectrum inputs.
-2. Runs CometPlus search.
-3. Reads PIN candidates and applies static scoring from Percolator weights.
-4. Selects one winner PSM per spectrum.
-5. Estimates q-value/PEP from Percolator reference tables by score lookup.
-6. Exports novel-focused reports, warnings, and run metadata.
+1. CometPlus path: resolve mass-spectrum input(s), run CometPlus, score PIN, select winners, estimate q/PEP, and export reports.
+2. Direct PIN path (`--input-pin`): skip CometPlus, score the provided PIN directly, then continue with winner selection/estimation/reporting.
+
+It also supports early-stop modes:
+
+1. `--stop-after-saving-novel-peptide`
+2. `--stop-after-cometplus`
+
+Both stop before scoring and write metadata/warnings only.
 
 ## 2. Runtime Flow (Internal Steps)
 
 ## Step 0: CLI parsing and entry checks (`protcosmo.main`)
 
-1. Build parser with fixed ProtCosmo arguments and help text.
-2. Parse known args; unknown args are collected as `passthrough_args`.
-3. Reject legacy `--input_tsv` if present in passthrough arguments.
+1. Build parser with ProtCosmo arguments.
+2. Parse known args; unknown args become `passthrough_args`.
+3. Reject legacy `--input_tsv` if present in passthrough args.
 4. Call `run_pipeline(args, passthrough_args)`.
 
 ## Step 1: Build normalized pipeline config (`utils.config_loader.load_pipeline_config`)
 
-1. Validate `--output-prefix` is non-empty.
-2. Resolve `--mass-file` to concrete files using `resolve_mass_files`.
-3. Detect novel mode when any of these are set:
-   - `--novel_protein`
-   - `--novel_peptide`
-   - `--internal_novel_peptide`
-4. If novel mode + multiple mass files:
-   - merge into one CometPlus run containing all mass files.
-   - otherwise run one CometPlus call per mass file.
-5. Enforce single-value-only for:
-   - `--params`
-   - `--database`
-6. Map these fields to run count (broadcast 1 value or strict N:1):
-   - `--init-weights`
-   - `--percolator-psms`
-   - `--percolator-peptides`
-7. If multiple runs and any scan filter is set (`--scan`, `--scan_numbers`, `--first-scan`, `--last-scan`):
-   - disable scan filters.
-   - add warning.
+1. Normalize and validate `--output-prefix` (must be non-empty).
+2. Read control flags:
+   - `--stop-after-saving-novel-peptide`
+   - `--stop-after-cometplus`
+   - `--input-pin`
+3. Validate mode conflicts:
+   - `--stop-after-saving-novel-peptide` and `--stop-after-cometplus` are mutually exclusive.
+   - `--input-pin` cannot be combined with either stop-after flag.
+4. If `--input-pin` is set:
+   - resolve `--input-pin` path to absolute path;
+   - require `--init-weights`, `--percolator-psms`, `--percolator-peptides`;
+   - build exactly one `RunConfig` using the pin path as `mass_file`;
+   - do not require `--mass-file`, `--params`, `--database`.
+5. Else (CometPlus path):
+   - require `--mass-file` and resolve it via `resolve_mass_files`;
+   - detect novel mode if any of `--novel_protein`, `--novel_peptide`, `--internal_novel_peptide` is set;
+   - if novel mode + multiple mass files, merge into one run; otherwise one run per mass file;
+   - require single-value `--params` and `--database`.
+6. Scoring reference requirements:
+   - normal mode: `--init-weights`, `--percolator-psms`, `--percolator-peptides` are required;
+   - stop-after modes: these are optional.
+7. For multi-run CometPlus mode, if any scan filter is set (`--scan`, `--scan_numbers`, `--first-scan`, `--last-scan`), disable scan filters and append warning.
 
-Output of this step is `PipelineConfig` with `runs: List[RunConfig]`.
+Output is `PipelineConfig` with normalized `runs`.
 
-## Step 1.1: Mass-file resolver internals (`utils.mass_file_resolver`)
+## Step 1.1: Mass-file resolver (`utils.mass_file_resolver`)
 
 `--mass-file` supports:
 
 1. Single file.
 2. Comma-separated list.
 3. Directory (collect supported suffixes).
-4. List file (one path per line, `#` comments allowed, comma also allowed per line).
+4. List file (one path per line; `#` comments; comma allowed per line).
 
-Internal behavior:
+Resolver behavior:
 
-1. Resolve relative paths against current working directory (or list-file directory for list entries).
+1. Resolve relative paths against cwd (or list-file directory for list entries).
 2. Validate existence.
-3. For directories, include only supported mass formats.
-4. De-duplicate resolved files while preserving order.
-5. For non-supported single files, attempt list parsing first; if list has no usable entries, fallback to treating it as direct mass file path.
+3. For directories, keep only supported spectrum formats.
+4. De-duplicate while preserving order.
+5. For non-supported single files, attempt list parsing first; if empty, fallback to direct path.
 
-## Step 2: Initialize pipeline context (`protcosmo.run_pipeline`)
+## Step 2: Initialize runtime context (`protcosmo.run_pipeline`)
 
-1. Record start timestamp (UTC).
+1. Record UTC start time.
 2. Ensure output directory exists.
-3. Initialize:
-   - warnings list (seeded from config warnings),
-   - model cache (`init_weights` -> parsed models),
-   - PSM lookup cache (`percolator_psms` -> lookup table),
-   - peptide lookup cache (`percolator_peptides` -> lookup table),
-   - winner collection list,
-   - Comet command record list.
+3. Initialize caches and collectors:
+   - model cache,
+   - PSM lookup cache,
+   - peptide lookup cache,
+   - warnings,
+   - winner frame parts,
+   - command records.
+4. Compute early-stop flag:
+   - `stop_after_any = stop_after_saving_novel_peptide or stop_after_cometplus`.
 
-## Step 3: Build and run CometPlus command per run (`utils.comet_runner`)
+## Step 3: CometPlus execution (`utils.comet_runner`, CometPlus path only)
 
-For each `RunConfig`:
+For each run:
 
-1. Build command with required fixed options:
-   - `--params <abs path>`
-   - `--database <abs path>`
-   - `--output-folder <abs output-dir>`
-   - `--output_percolatorfile 1`
-   - `--max_duplicate_proteins -1`
-2. Append optional ProtCosmo-managed options when present:
-   - novel inputs/outputs (`--novel_protein`, `--novel_peptide`, `--output_internal_novel_peptide`, `--internal_novel_peptide`)
-   - `--stop-after-saving-novel-peptide`
-   - `--keep-tmp`
-   - `--run-comet-each` (enabled by default)
-   - `--thread`
-   - scan filters (only when enabled by Step 1 rules)
-3. Append passthrough args unchanged.
-4. Append run mass file(s).
-5. Execute via `subprocess.run(..., capture_output=True)`.
-6. Write logs:
+1. Build command with fixed options:
+   - `--params`, `--database`, `--output-folder`, `--output_percolatorfile 1`, `--max_duplicate_proteins -1`.
+2. Append optional ProtCosmo-managed flags:
+   - novel inputs/outputs (`--novel_protein`, `--novel_peptide`, `--output_internal_novel_peptide`, `--internal_novel_peptide`),
+   - `--stop-after-saving-novel-peptide`,
+   - `--keep-tmp`,
+   - `--run-comet-each`,
+   - `--thread`,
+   - scan filters (only if enabled by config).
+3. If in novel mode and `--output_internal_novel_peptide` is not provided, auto set:
+   - `<output-prefix>.internal_novel_peptide.tsv` under output dir.
+4. Append passthrough args and run mass files.
+5. Execute by `subprocess.run(..., capture_output=True)`.
+6. Write ProtCosmo run logs:
    - `<prefix>.cometplus.run_XXXX.stdout.log`
    - `<prefix>.cometplus.run_XXXX.stderr.log`
-7. If CometPlus returns non-zero:
-   - raise runtime error with command and log paths.
-8. If PIN output is required:
-   - detect newest changed `*.pin*`.
-   - in novel mode, normalize output name to `<prefix>.cometplus.novel.pin` (decompress/convert if needed).
+7. If CometPlus emits `command.stdout.log` / `command.stderr.log`, rename to prefixed names:
+   - `<prefix>.command.stdout.log`
+   - `<prefix>.command.stderr.log`
+8. If exit code is non-zero, raise runtime error with command + log paths.
+9. If PIN is required (`require_pin_output=True`):
+   - detect newest changed `*.pin*`;
+   - in novel mode normalize to `<prefix>.cometplus.novel.pin` (including `.pin.gz` decompression and parquet->tsv conversion).
 
-Each run is recorded into metadata (`command`, shell-escaped command, logs, return code, PIN path).
+Each run is recorded in metadata command records.
 
-## Step 4: Early-stop mode (`--stop-after-saving-novel-peptide`)
+## Step 4: Score source selection
 
-If enabled:
+1. If `--input-pin` mode:
+   - skip Step 3 entirely;
+   - use the provided PIN path as scoring input.
+2. Else:
+   - use `pin_path` returned by Step 3 per run.
 
-1. Skip all PIN scoring/selection logic.
+Scoring per run uses shared helper logic (`_score_winner_rows_from_pin`).
+
+## Step 5: Per-run scoring and winner table build
+
+For each run to be scored:
+
+1. Validate scoring references are available (`init_weights`, `percolator_psms`, `percolator_peptides`).
+2. Read PIN (`utils.pin_reader.read_pin`):
+   - supports text/gz/parquet,
+   - canonicalizes aliases,
+   - enforces required logical columns.
+3. Parse static models from `--init-weights` (`utils.weights_parser.parse_selected_models`):
+   - for repeated Percolator CV blocks (`header -> normalized -> raw`), select raw rows (commonly numeric 2/4/6),
+   - require `m0` intercept,
+   - enforce aligned feature order.
+4. Score every PIN candidate row (`utils.scoring.score_pin_candidates`):
+   - for each selected model, compute `model_score_k = w_k^T x + b_k`,
+   - resolve model feature names to PIN columns with flexible alias matching,
+   - if needed, derive charge features (for example from `Charge1..ChargeN` one-hot),
+   - coerce feature values to numeric and fill missing as `0.0`,
+   - set `final_score = mean(model_score_1, model_score_2, model_score_3)` from the 3 selected raw models.
+5. Select one winner PSM per spectrum (`utils.selection.select_best_psm_per_spectrum`):
+   - sort by `final_score` descending,
+   - tie-break 1: prefer non-`novel_only`,
+   - tie-break 2: smaller `SpecId` rank suffix.
+6. Estimate winner PSM q/PEP from `--percolator-psms` via nearest smaller-or-equal score lookup using winner `final_score`:
+   - lookup partition key is input-file key parsed from `SpecId`/`PSMId` prefix (before first `_`),
+   - score matching is performed within that partition when possible; fallback is full-table lookup.
+7. Attach per-run metadata columns to winners and append to global winner list.
+
+## Step 6: Early-stop handling
+
+If `stop_after_any` is true:
+
+1. Skip all downstream novel filtering/summaries.
 2. Write only:
    - `<prefix>.warnings.log`
    - `<prefix>.run_metadata.json`
-3. Return immediately.
+3. Set metadata `mode` to:
+   - `stop_after_saving_novel_peptide` or
+   - `stop_after_cometplus`.
+4. Return immediately.
 
-## Step 5: Read PIN and parse static models
+## Step 7: Novel subset and peptide/protein summaries
 
-For each run (normal mode):
+Normal mode only:
 
-1. Read PIN table (`utils.pin_reader.read_pin`):
-   - supports TSV-like text, `.gz`, and parquet.
-   - canonicalizes known column aliases.
-   - requires at least `SpecId` and `Peptide`.
-   - ensures numeric conversion for known feature columns.
-2. Parse models from `--init-weights` (`utils.weights_parser.parse_selected_models`):
-   - parse header + numeric rows,
-   - select numeric rows 1, 3, and 5 only,
-   - require `m0` as intercept column,
-   - output `LinearModel(feature_names, weights, intercept)`.
-3. Validate all selected models share identical feature order.
-
-## Step 6: Score PIN candidates (`utils.scoring.score_pin_candidates`)
-
-For each selected model:
-
-1. Resolve model feature names to PIN columns using normalized matching + alias rules.
-2. If needed, derive charge-related features from:
-   - direct `ChargeN`, or
-   - one-hot `Charge1..Charge6`.
-3. Build numeric matrix `X` and compute:
-   - `model_score_k = X @ w + b`
-4. After all 3 models:
-   - `final_score = mean(model_score_1, model_score_2, model_score_3)`.
-
-If required feature mapping fails, pipeline raises an explicit error with suggestions.
-
-## Step 7: Winner selection per spectrum (`utils.selection.select_best_psm_per_spectrum`)
-
-1. Derive:
-   - `spectrum_id` from `SpecId` without trailing `_rank`,
-   - `rank_index` from trailing numeric rank (else very large fallback),
-   - `novel_only` from `Proteins` (all protein IDs must be `COMETPLUS_NOVEL_...`, ignoring optional `DECOY_` prefix).
-2. Sort by:
-   - `mass_file` ascending,
-   - `spectrum_id` ascending,
-   - `final_score` descending,
-   - `novel_only` ascending (non-novel preferred on tie),
-   - `rank_index` ascending.
-3. Keep first row per (`mass_file`, `spectrum_id`).
-
-## Step 8: PSM-level estimated q/PEP (`utils.percolator_ref`)
-
-1. Load reference table from `--percolator-psms` (TSV/parquet).
-2. Detect required logical columns by candidate names:
-   - score,
-   - q-value,
-   - posterior error probability (PEP).
-3. Normalize to numeric and drop invalid rows.
-4. Sort by score and keep best row for duplicate score.
-5. For each winner `final_score`, use nearest smaller-or-equal reference score (`searchsorted(..., side="right") - 1`).
-6. If no smaller score exists:
-   - assign `estimated_psm_q_value = 1`,
-   - assign `estimated_psm_pep = 1`,
-   - flag fallback and add warning.
-
-## Step 9: Novel subset and peptide/protein summaries
-
-1. Keep `novel_only` winners as `novel_psms`.
-2. Derive peptide forms (`utils.peptide_utils`):
-   - `modified_peptide`: remove flanking residues from `A.PEPTIDE.B` style.
-   - `unmodified_peptide`: remove bracket mods and keep amino-acid letters only.
-3. Extract `novel_protein_ids` from `Proteins`.
-4. Estimate peptide-level q/PEP using `--percolator-peptides` with same lookup rule as Step 8.
-5. Build in-memory summaries:
+1. Concatenate all winners.
+2. Keep `novel_only` winners as `novel_psms`.
+3. Build peptide representations:
+   - `modified_peptide`,
+   - `unmodified_peptide`.
+4. Extract `novel_protein_ids`.
+5. Estimate peptide-level q/PEP from `--percolator-peptides`:
+   - input score is still each winner row `final_score` (not a separate peptide-rescoring model),
+   - same nearest smaller-or-equal lookup rule as PSM estimation,
+   - lookup also uses input-file key partitions derived from `PSMId` prefix when available,
+   - fallback when no smaller score exists: q-value=1 and PEP=1 (warning logged).
+6. Build summaries from `novel_psms`:
    - modified peptide summary,
    - unmodified peptide summary,
    - novel protein summary.
+7. Peptide lookup is done per input-file partition when available (`PSMId` prefix).
+8. Final `novel.peptides.tsv` keeps one row per `peptide` by highest matched peptide `score`, so `peptide` is unique in output.
 
-## Step 10: Write output files (`utils.report_writer`)
+## Step 8: Output and metadata
 
-Normal mode writes:
+Normal mode outputs:
 
 1. `<prefix>.nove.psms.tsv` (exact current filename in code)
-2. `<prefix>.novel.peptides.tsv` (modified-peptide summary)
+   - reference-style columns:
+     `PSMId`, `score`, `q-value`, `posterior_error_prob`, `peptide`, `proteinIds`
+   - `score` comes from matched reference score lookup (not raw `final_score`),
+   - `proteinIds` are comma-joined,
+   - rows sorted by `score` descending.
+2. `<prefix>.novel.peptides.tsv`
+   - reference-style columns only:
+     `PSMId`, `score`, `q-value`, `posterior_error_prob`, `peptide`, `proteinIds`
+   - one highest-score row kept per `peptide` (unique peptide values),
+   - rows sorted by `score` descending.
 3. `<prefix>.warnings.log`
 4. `<prefix>.run_metadata.json`
 
 Metadata includes:
 
-1. Start/end time and duration.
-2. Original argv and passthrough args.
-3. Run count, warning count, warnings.
-4. Per-run command records and output paths.
-5. Counts for all winners, novel PSMs, novel modified peptides, novel unmodified peptides, and novel proteins.
+1. start/end/duration,
+2. argv and passthrough args,
+3. output dir and output prefix,
+4. `input_pin` (path or null),
+5. warnings and counts,
+6. per-run command records (empty in input-pin mode),
+7. winner/novel counts.
 
 ## 3. Important Behavior Notes
 
-1. Unknown CLI options are intentionally forwarded to CometPlus.
-2. Scan filters are only effective when final run count is exactly one.
-3. q-value/PEP are estimated by lookup, not re-trained/recomputed Percolator results.
-4. Caches avoid re-loading repeated weights/reference files across runs.
-5. In novel mode with multiple mass files, ProtCosmo intentionally merges them into one CometPlus invocation.
+1. Unknown CLI options are forwarded to CometPlus only when CometPlus path is used.
+2. In `--input-pin` mode, CometPlus is not invoked and command records are empty.
+3. Scan filters are effective only when final CometPlus run count is exactly one.
+4. q-value/PEP are lookup estimates, not retrained Percolator outputs.
+5. PSM and peptide estimates both use `final_score` from static model scoring; they differ by reference table (`--percolator-psms` vs `--percolator-peptides`) and input-file partition.
+6. Peptide-level output rows are score-representative rows (highest matched peptide score), not global lowest-q aggregations.
+7. Output score fields are matched reference scores.
+8. Caches avoid re-loading duplicated models/references across runs.
+9. In novel mode with multiple mass files, inputs are merged into one CometPlus invocation.

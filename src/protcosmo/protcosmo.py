@@ -25,8 +25,8 @@ if __package__ in (None, ""):
         collapse_to_unmodified,
         normalize_modified_peptide,
     )
-    from protcosmo.utils.percolator_ref import build_reference_lookup  # type: ignore
-    from protcosmo.utils.pin_reader import join_proteins, read_pin, split_proteins  # type: ignore
+    from protcosmo.utils.percolator_ref import build_partitioned_reference_lookup  # type: ignore
+    from protcosmo.utils.pin_reader import read_pin, split_proteins  # type: ignore
     from protcosmo.utils.report_writer import (  # type: ignore
         ensure_dir,
         write_json,
@@ -47,8 +47,8 @@ else:
     from .utils.comet_runner import run_cometplus_search
     from .utils.config_loader import load_pipeline_config
     from .utils.peptide_utils import collapse_to_unmodified, normalize_modified_peptide
-    from .utils.percolator_ref import build_reference_lookup
-    from .utils.pin_reader import join_proteins, read_pin, split_proteins
+    from .utils.percolator_ref import build_partitioned_reference_lookup
+    from .utils.pin_reader import read_pin, split_proteins
     from .utils.report_writer import ensure_dir, write_json, write_tsv, write_warnings
     from .utils.scoring import score_pin_candidates
     from .utils.selection import get_novel_protein_ids, select_best_psm_per_spectrum
@@ -141,9 +141,10 @@ Step 2. Run CometPlus for each mass file
 
 Step 3. Static scoring from --init-weights
 - --init-weights is a Percolator weights file used for re-scoring PIN candidates.
-- ProtCosmo always parses numeric rows 1, 3, and 5.
+- For Percolator CV exports with repeated blocks
+  (header -> normalized row -> raw row), ProtCosmo uses raw rows 2, 4, and 6.
 - For each selected row/model: score_k = w_k^T x + b_k  (b_k is column m0)
-- Final candidate score: final_score = mean(score_1, score_3, score_5)
+- Final candidate score: final_score = mean(score_1, score_2, score_3)
 
 Step 4. Select winner per spectrum
 - Winner selection per spectrum:
@@ -248,7 +249,7 @@ Option details and format examples:
 --init-weights <file>
 - Percolator weight file used to score Comet PIN candidates.
 - Expected shape: header row with feature names (must include m0), then numeric rows.
-- ProtCosmo uses numeric rows 1, 3, and 5 for the final score.
+- ProtCosmo prefers raw-weight rows (commonly numeric rows 2, 4, and 6).
 
 --input-pin <file>
 - Skip CometPlus and directly score this PIN.
@@ -451,7 +452,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="init_weights",
         help=(
             "Percolator weight file(s) used to score PIN candidates.\n"
-            "ProtCosmo parses numeric rows 1/3/5, applies score=w^T x + b, and averages the three scores.\n"
+            "ProtCosmo prefers raw-weight rows (commonly 2/4/6), applies score=w^T x + b, "
+            "and averages the three scores.\n"
             "One value may be broadcast, or provide comma-separated values matching --mass-file count."
         ),
     )
@@ -491,6 +493,41 @@ def _lookup_cache_get(cache: Dict[str, object], key: str, loader):
     return cache[key]
 
 
+def _join_unique_csv(tokens: Sequence[str]) -> str:
+    seen = set()
+    ordered: List[str] = []
+    for token in tokens:
+        text = str(token).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+    return ",".join(ordered)
+
+
+def _protein_ids_csv_from_text(proteins_text: str) -> str:
+    return _join_unique_csv(split_proteins(proteins_text))
+
+
+def _make_psm_output_table(novel_psms: pd.DataFrame) -> pd.DataFrame:
+    columns = ["PSMId", "score", "q-value", "posterior_error_prob", "peptide", "proteinIds"]
+    if novel_psms.empty:
+        return pd.DataFrame(columns=columns)
+
+    output = pd.DataFrame(
+        {
+            "PSMId": novel_psms["SpecId"].astype(str),
+            "score": pd.to_numeric(novel_psms["estimated_psm_matched_score"], errors="coerce"),
+            "q-value": pd.to_numeric(novel_psms["estimated_psm_q_value"], errors="coerce"),
+            "posterior_error_prob": pd.to_numeric(novel_psms["estimated_psm_pep"], errors="coerce"),
+            "peptide": novel_psms["modified_peptide"].astype(str),
+            "proteinIds": novel_psms["Proteins"].astype(str).map(_protein_ids_csv_from_text),
+        }
+    )
+    output = output.sort_values(by=["score", "PSMId"], ascending=[False, True], na_position="last")
+    return output.loc[:, columns].reset_index(drop=True)
+
+
 def _compute_peptide_estimates(novel_psms: pd.DataFrame, lookup_cache: Dict[str, object]) -> pd.DataFrame:
     if novel_psms.empty:
         novel_psms["estimated_peptide_q_value"] = np.nan
@@ -505,9 +542,10 @@ def _compute_peptide_estimates(novel_psms: pd.DataFrame, lookup_cache: Dict[str,
     novel_psms["estimated_peptide_matched_score"] = np.nan
     novel_psms["estimated_peptide_fallback"] = False
 
-    grouped = novel_psms.groupby("percolator_peptides_file").groups
-    for ref_path, index_values in grouped.items():
-        lookup = _lookup_cache_get(lookup_cache, ref_path, build_reference_lookup)
+    grouped = novel_psms.groupby(["percolator_peptides_file", "input_file_key"], dropna=False).groups
+    for (ref_path, input_file_key), index_values in grouped.items():
+        partitioned_lookup = _lookup_cache_get(lookup_cache, ref_path, build_partitioned_reference_lookup)
+        lookup = partitioned_lookup.lookup_for_input_key(str(input_file_key))
         index_list = list(index_values)
         scores = novel_psms.loc[index_list, "final_score"].to_numpy(dtype=np.float64, copy=False)
         est_q, est_pep, matched, fallback = lookup.estimate_array(scores)
@@ -519,54 +557,32 @@ def _compute_peptide_estimates(novel_psms: pd.DataFrame, lookup_cache: Dict[str,
 
 
 def _make_modified_summary(novel_psms: pd.DataFrame) -> pd.DataFrame:
-    if novel_psms.empty:
-        return pd.DataFrame(
-            columns=[
-                "mass_file",
-                "modified_peptide",
-                "unmodified_peptide",
-                "novel_psm_count",
-                "best_final_score",
-                "estimated_psm_q_value",
-                "estimated_psm_pep",
-                "estimated_peptide_q_value",
-                "estimated_peptide_pep",
-                "novel_protein_count",
-            ]
-        )
+    """Build reference-style peptide table with one highest-score row per peptide."""
 
-    ranked = novel_psms.sort_values(["mass_file", "modified_peptide", "final_score"], ascending=[True, True, False])
-    best = ranked.groupby(["mass_file", "modified_peptide"], as_index=False).first()
-    counts = (
-        novel_psms.groupby(["mass_file", "modified_peptide"], as_index=False)
-        .size()
-        .rename(columns={"size": "novel_psm_count"})
+    columns = ["PSMId", "score", "q-value", "posterior_error_prob", "peptide", "proteinIds"]
+    if novel_psms.empty:
+        return pd.DataFrame(columns=columns)
+
+    table = pd.DataFrame(
+        {
+            "PSMId": novel_psms["SpecId"].astype(str),
+            "score": pd.to_numeric(novel_psms["estimated_peptide_matched_score"], errors="coerce"),
+            "q-value": pd.to_numeric(novel_psms["estimated_peptide_q_value"], errors="coerce"),
+            "posterior_error_prob": pd.to_numeric(novel_psms["estimated_peptide_pep"], errors="coerce"),
+            "peptide": novel_psms["modified_peptide"].astype(str),
+            "proteinIds": novel_psms["Proteins"].astype(str).map(_protein_ids_csv_from_text),
+            "_final_score": pd.to_numeric(novel_psms["final_score"], errors="coerce"),
+        }
     )
-    protein_counts = (
-        novel_psms.assign(_novel_protein_ids=novel_psms["novel_protein_ids"])
-        .explode("_novel_protein_ids")
-        .dropna(subset=["_novel_protein_ids"])
-        .groupby(["mass_file", "modified_peptide"], as_index=False)["_novel_protein_ids"]
-        .nunique()
-        .rename(columns={"_novel_protein_ids": "novel_protein_count"})
+
+    ranked = table.sort_values(
+        by=["peptide", "score", "_final_score", "PSMId"],
+        ascending=[True, False, False, True],
+        na_position="last",
     )
-    summary = best.merge(counts, on=["mass_file", "modified_peptide"], how="left")
-    summary = summary.merge(protein_counts, on=["mass_file", "modified_peptide"], how="left")
-    summary["novel_protein_count"] = summary["novel_protein_count"].fillna(0).astype(int)
-    summary = summary.rename(columns={"final_score": "best_final_score"})
-    keep_cols = [
-        "mass_file",
-        "modified_peptide",
-        "unmodified_peptide",
-        "novel_psm_count",
-        "best_final_score",
-        "estimated_psm_q_value",
-        "estimated_psm_pep",
-        "estimated_peptide_q_value",
-        "estimated_peptide_pep",
-        "novel_protein_count",
-    ]
-    return summary.loc[:, keep_cols]
+    best_per_peptide = ranked.groupby("peptide", as_index=False, sort=False).first()
+    output = best_per_peptide.sort_values(by=["score", "PSMId"], ascending=[False, True], na_position="last")
+    return output.loc[:, columns].reset_index(drop=True)
 
 
 def _make_unmodified_summary(novel_psms: pd.DataFrame) -> pd.DataFrame:
@@ -694,9 +710,24 @@ def _score_winner_rows_from_pin(
     scored = score_pin_candidates(pin_df, models)
     winners = select_best_psm_per_spectrum(scored, run.mass_file)
 
-    psm_lookup = _lookup_cache_get(psm_lookup_cache, run.percolator_psms, build_reference_lookup)
-    psm_scores = winners["final_score"].to_numpy(dtype=np.float64, copy=False)
-    est_q, est_pep, matched, fallback = psm_lookup.estimate_array(psm_scores)
+    partitioned_lookup = _lookup_cache_get(
+        psm_lookup_cache, run.percolator_psms, build_partitioned_reference_lookup
+    )
+    est_q = np.full(len(winners), np.nan, dtype=np.float64)
+    est_pep = np.full(len(winners), np.nan, dtype=np.float64)
+    matched = np.full(len(winners), np.nan, dtype=np.float64)
+    fallback = np.zeros(len(winners), dtype=bool)
+
+    for input_file_key, index_values in winners.groupby("input_file_key", dropna=False).groups.items():
+        index_list = list(index_values)
+        lookup = partitioned_lookup.lookup_for_input_key(str(input_file_key))
+        psm_scores = winners.loc[index_list, "final_score"].to_numpy(dtype=np.float64, copy=False)
+        g_q, g_pep, g_matched, g_fallback = lookup.estimate_array(psm_scores)
+        est_q[index_list] = g_q
+        est_pep[index_list] = g_pep
+        matched[index_list] = g_matched
+        fallback[index_list] = g_fallback
+
     fallback_count = int(np.count_nonzero(fallback))
     if fallback_count > 0:
         warnings.append(
@@ -715,7 +746,7 @@ def _score_winner_rows_from_pin(
     winners["init_weights_file"] = run.init_weights
     winners["percolator_psms_file"] = run.percolator_psms
     winners["percolator_peptides_file"] = run.percolator_peptides
-    winners["protein_ids"] = winners["Proteins"].astype(str).map(split_proteins).map(join_proteins)
+    winners["protein_ids"] = winners["Proteins"].astype(str).map(_protein_ids_csv_from_text)
     return winners
 
 
@@ -834,12 +865,7 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
     modified_summary = _make_modified_summary(novel_psms)
     unmodified_summary = _make_unmodified_summary(novel_psms)
     protein_summary = _make_protein_summary(novel_psms)
-
-    novel_psms_out = novel_psms.copy()
-    if "novel_protein_ids" in novel_psms_out.columns:
-        novel_psms_out["novel_protein_ids"] = novel_psms_out["novel_protein_ids"].map(
-            lambda x: join_proteins(x) if isinstance(x, list) else ""
-        )
+    novel_psms_out = _make_psm_output_table(novel_psms)
 
     output_paths = {
         "novel_psms": str(output_dir / f"{output_prefix}.nove.psms.tsv"),
