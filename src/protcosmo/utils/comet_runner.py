@@ -103,6 +103,8 @@ def build_comet_command(
         _resolve_arg_path(run.params),
         "--database",
         _resolve_arg_path(run.database),
+        "--output-folder",
+        str(Path(config.output_dir).expanduser().resolve()),
         "--output_percolatorfile",
         "1",
         "--max_duplicate_proteins",
@@ -127,6 +129,10 @@ def build_comet_command(
         command.extend(["--internal_novel_peptide", _resolve_arg_path(config.internal_novel_peptide)])
     if config.stop_after_saving_novel_peptide:
         command.append("--stop-after-saving-novel-peptide")
+    if config.keep_tmp:
+        command.append("--keep-tmp")
+    if config.run_comet_each:
+        command.append("--run-comet-each")
     if config.thread is not None:
         command.extend(["--thread", str(config.thread)])
 

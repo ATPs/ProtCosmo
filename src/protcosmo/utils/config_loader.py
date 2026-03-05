@@ -35,6 +35,8 @@ class PipelineConfig:
     output_internal_novel_peptide: Optional[str]
     internal_novel_peptide: Optional[str]
     stop_after_saving_novel_peptide: bool
+    keep_tmp: bool
+    run_comet_each: bool
     thread: Optional[int]
     scan: Optional[str]
     scan_numbers: Optional[str]
@@ -167,6 +169,8 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
         output_internal_novel_peptide=getattr(args, "output_internal_novel_peptide", None),
         internal_novel_peptide=getattr(args, "internal_novel_peptide", None),
         stop_after_saving_novel_peptide=stop_after,
+        keep_tmp=bool(getattr(args, "keep_tmp", False)),
+        run_comet_each=bool(getattr(args, "run_comet_each", True)),
         thread=args.thread,
         scan=args.scan,
         scan_numbers=args.scan_numbers,

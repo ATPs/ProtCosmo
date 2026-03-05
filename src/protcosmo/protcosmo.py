@@ -80,11 +80,15 @@ SHORT_EPILOG = f"""
 Quick format notes:
 - --mass-file supports: single file, comma list, list file (one path per line), or directory.
 - --params and --database each accept only one value.
+- --output-dir is also forwarded to CometPlus as --output-folder.
+- --output-prefix controls ProtCosmo-generated output filename prefix (default: protcosmo).
+- --run-comet-each is forwarded to CometPlus by default.
 - --novel_protein: FASTA input.
 - --novel_peptide: FASTA or tokenized text (comma/space/tab/newline delimiters).
-- --output_internal_novel_peptide: auto-enabled in novel mode as `--output-dir/protcosmo.internal_novel_peptide.tsv`.
+- --output_internal_novel_peptide: auto-enabled in novel mode as `--output-dir/<output-prefix>.internal_novel_peptide.tsv`.
 - --internal_novel_peptide: reuse previously exported internal novel TSV.
 - --stop-after-saving-novel-peptide: stop after TSV export, skip search/scoring in ProtCosmo.
+- --keep-tmp: keep CometPlus temporary files.
 - --scan/--scan_numbers/--first-scan/--last-scan: only applied when exactly one run is resolved.
 
 {ESTIMATION_NOTE}
@@ -116,12 +120,13 @@ Step 1. Build run configuration
 
 Step 2. Run CometPlus for each mass file
 - ProtCosmo builds a CometPlus command with:
-  --params, --database, --output_percolatorfile 1, --max_duplicate_proteins -1
+  --params, --database, --output-folder <output-dir>,
+  --output_percolatorfile 1, --max_duplicate_proteins -1
 - One run may include one or many spectrum input files.
 - Optional ProtCosmo-controlled options forwarded to CometPlus:
   --novel_protein, --novel_peptide, --output_internal_novel_peptide,
   --internal_novel_peptide, --stop-after-saving-novel-peptide,
-  --thread, scan filters (single-run only)
+  --keep-tmp, --run-comet-each, --thread, scan filters (single-run only)
 - Unknown options are passed through to CometPlus unchanged.
 - Each run writes logs to:
   <output-dir>/cometplus.run_xxxx.stdout.log
@@ -151,10 +156,10 @@ Step 5. Estimate q-value/PEP by lookup
 - Fallback when no smaller score exists: q-value=1 and PEP=1 (warning logged).
 
 Step 6. Write outputs
-- protcosmo.novel_psms.tsv
-- protcosmo.novel_peptides.modified.tsv
-- protcosmo.warnings.log
-- protcosmo.run_metadata.json
+- <output-prefix>.nove.psms.tsv
+- <output-prefix>.novel.peptides.tsv
+- <output-prefix>.warnings.log
+- <output-prefix>.run_metadata.json
 
 Option details and format examples:
 
@@ -188,7 +193,7 @@ Option details and format examples:
 - Default behavior in ProtCosmo:
   - if --novel_protein or --novel_peptide is provided and this option is not set,
     ProtCosmo auto-adds:
-    --output_internal_novel_peptide <output-dir>/protcosmo.internal_novel_peptide.tsv
+    --output_internal_novel_peptide <output-dir>/<output-prefix>.internal_novel_peptide.tsv
   - this path is shared across runs, so only one file version is kept.
 
 --internal_novel_peptide <file>
@@ -200,6 +205,15 @@ Option details and format examples:
 - CometPlus exits after saving internal TSV.
 - In this mode, ProtCosmo does not run PIN scoring and does not write novel_psms/novel_peptides reports.
 - ProtCosmo still writes run metadata and warnings logs.
+
+--keep-tmp
+- Forwarded directly to CometPlus.
+- Keep CometPlus temporary/intermediate files.
+
+--run-comet-each / --no-run-comet-each
+- Forwarded directly to CometPlus as `--run-comet-each`.
+- Default in ProtCosmo: enabled.
+- Use `--no-run-comet-each` to disable forwarding this option.
 
 --scan <file>
 - Text file of positive scan integers.
@@ -288,9 +302,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="override CometPlus num_threads",
     )
     run_group.add_argument(
+        "--keep-tmp",
+        dest="keep_tmp",
+        action="store_true",
+        help="forward to CometPlus: keep temporary files",
+    )
+    run_group.add_argument(
+        "--run-comet-each",
+        dest="run_comet_each",
+        action="store_true",
+        default=True,
+        help="forward to CometPlus: run each mass-file input in CometPlus mode (default: enabled)",
+    )
+    run_group.add_argument(
+        "--no-run-comet-each",
+        dest="run_comet_each",
+        action="store_false",
+        help="disable forwarding --run-comet-each to CometPlus",
+    )
+    run_group.add_argument(
         "--output-dir",
         required=True,
-        help="output directory for reports, metadata, and CometPlus outputs/logs",
+        help=(
+            "output directory for reports, metadata, and CometPlus outputs/logs.\n"
+            "Also forwarded to CometPlus as --output-folder."
+        ),
+    )
+    run_group.add_argument(
+        "--output-prefix",
+        default="protcosmo",
+        help="filename prefix for ProtCosmo outputs (default: protcosmo)",
     )
 
     novel_group = parser.add_argument_group("Novel and scan-subset inputs")
@@ -320,7 +361,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "forward to CometPlus: export internal novel TSV (columns: peptide, peptide_id, protein_id).\n"
             "Default (auto-enabled when --novel_protein or --novel_peptide is used):\n"
-            "  <output-dir>/protcosmo.internal_novel_peptide.tsv"
+            "  <output-dir>/<output-prefix>.internal_novel_peptide.tsv"
         ),
     )
     novel_group.add_argument(
@@ -607,7 +648,12 @@ def _make_protein_summary(novel_psms: pd.DataFrame) -> pd.DataFrame:
 def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
     start_time = dt.datetime.now(tz=dt.timezone.utc)
     config = load_pipeline_config(args, passthrough_args)
+    output_prefix = str(getattr(args, "output_prefix", "protcosmo")).strip()
+    if not output_prefix:
+        raise ValueError("--output-prefix cannot be empty.")
     output_dir = ensure_dir(config.output_dir)
+    if config.output_internal_novel_peptide is None and (config.novel_protein or config.novel_peptide):
+        config.output_internal_novel_peptide = str((output_dir / f"{output_prefix}.internal_novel_peptide.tsv").resolve())
 
     warnings: List[str] = list(config.warnings)
     model_cache: Dict[str, object] = {}
@@ -682,8 +728,8 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
 
     if config.stop_after_saving_novel_peptide:
         output_paths = {
-            "run_metadata": str(output_dir / "protcosmo.run_metadata.json"),
-            "warnings": str(output_dir / "protcosmo.warnings.log"),
+            "run_metadata": str(output_dir / f"{output_prefix}.run_metadata.json"),
+            "warnings": str(output_dir / f"{output_prefix}.warnings.log"),
         }
         write_warnings(warnings, Path(output_paths["warnings"]))
         end_time = dt.datetime.now(tz=dt.timezone.utc)
@@ -694,6 +740,7 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
             "argv": sys.argv,
             "passthrough_args": passthrough_args,
             "output_dir": str(output_dir),
+            "output_prefix": output_prefix,
             "mode": "stop_after_saving_novel_peptide",
             "estimation_note": ESTIMATION_NOTE,
             "use_scan_filters": config.use_scan_filters,
@@ -739,10 +786,10 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
         )
 
     output_paths = {
-        "novel_psms": str(output_dir / "protcosmo.novel_psms.tsv"),
-        "novel_peptides_modified": str(output_dir / "protcosmo.novel_peptides.modified.tsv"),
-        "run_metadata": str(output_dir / "protcosmo.run_metadata.json"),
-        "warnings": str(output_dir / "protcosmo.warnings.log"),
+        "novel_psms": str(output_dir / f"{output_prefix}.nove.psms.tsv"),
+        "novel_peptides_modified": str(output_dir / f"{output_prefix}.novel.peptides.tsv"),
+        "run_metadata": str(output_dir / f"{output_prefix}.run_metadata.json"),
+        "warnings": str(output_dir / f"{output_prefix}.warnings.log"),
     }
     write_tsv(novel_psms_out, Path(output_paths["novel_psms"]))
     write_tsv(modified_summary, Path(output_paths["novel_peptides_modified"]))
@@ -756,6 +803,7 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
         "argv": sys.argv,
         "passthrough_args": passthrough_args,
         "output_dir": str(output_dir),
+        "output_prefix": output_prefix,
         "estimation_note": ESTIMATION_NOTE,
         "use_scan_filters": config.use_scan_filters,
         "run_count": len(config.runs),
