@@ -14,6 +14,10 @@ Runtime helper placement:
 - Novel-output remap/report table helpers: `src/protcosmo/utils/novel_reports.py`
 - `protcosmo.py` binds scoring helpers as direct aliases from `utils.scoring_batches` and keeps a thin grouped-scoring bridge for patch/test compatibility.
 
+Documentation sync:
+
+- `README.md` includes end-to-end usage guidance and detailed CLI examples for all three run modes.
+
 ## 1. Goal
 
 ProtCosmo is a CLI pipeline with three configuration paths:
