@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, TextIO
 
 import numpy as np
@@ -19,6 +20,7 @@ if __package__ in (None, ""):
     from protcosmo import __version__  # type: ignore
     from protcosmo.utils.comet_runner import run_cometplus_search  # type: ignore
     from protcosmo.utils.config_loader import load_pipeline_config  # type: ignore
+    from protcosmo.utils.input_key import extract_input_file_key  # type: ignore
     from protcosmo.utils.peptide_utils import (  # type: ignore
         collapse_to_unmodified,
         normalize_modified_peptide,
@@ -42,6 +44,7 @@ else:
     from . import __version__
     from .utils.comet_runner import run_cometplus_search
     from .utils.config_loader import load_pipeline_config
+    from .utils.input_key import extract_input_file_key
     from .utils.peptide_utils import collapse_to_unmodified, normalize_modified_peptide
     from .utils.percolator_ref import build_partitioned_reference_lookup
     from .utils.pin_reader import read_pin, split_proteins
@@ -55,6 +58,8 @@ ESTIMATION_NOTE = (
     "q-value and PEP are estimated by score lookup from reference Percolator outputs. "
     "Real q-value/PEP are expected to be smaller than the estimated values."
 )
+NOVEL_PREFIX = "COMETPLUS_NOVEL_"
+DECOY_PREFIX = "DECOY_"
 
 
 class ProtCosmoHelpFormatter(argparse.RawTextHelpFormatter):
@@ -75,8 +80,13 @@ Use --help-full for step-by-step workflow, file-format details, and examples.
 SHORT_EPILOG = f"""
 Quick format notes:
 - --input-pin: skip CometPlus and score directly from this PIN file.
+- --input_tsv: row-based input table mode (required column: mass-file).
 - --mass-file supports: single file, comma list, list file (one path per line), or directory.
-- --params and --database each accept only one value (required unless --input-pin is set).
+- --input_tsv and --mass-file cannot be used together.
+- --input-pin takes precedence when both --input-pin and --input_tsv are provided.
+- --params and --database each accept only one value (required unless --input-pin is set, or set via --input_tsv rows).
+- --init-weights/--percolator-psms/--percolator-peptides each accept one CLI value.
+- In --input_tsv mode, per-mass-file scoring variation is configured from TSV rows.
 - --output-dir is also forwarded to CometPlus as --output-folder.
 - --output-prefix controls ProtCosmo-generated output filename prefix (default: protcosmo).
 - --log: also write runtime logs/warnings to <output-dir>/<output-prefix>.log.
@@ -102,21 +112,29 @@ Step 1. Build run configuration
 - If --input-pin is provided:
   - ProtCosmo skips CometPlus and scores this PIN directly.
   - --mass-file/--params/--database are not required.
-- Resolve --mass-file into one or more concrete spectrum files.
-- Supported --mass-file styles:
-  - single mass spectrum file
-  - comma-separated list of files
-  - text file, one mass-file path per line (blank lines and # comments ignored)
-  - directory (all CometPlus-supported files in that directory are used)
-- CometPlus-supported suffixes recognized by ProtCosmo include:
-  .mgf, .mgf.gz, .mzML, .mzML.gz, .mzMLb, .mzXML, .mzXML.gz, .raw, .ms2, .cms2, .bms2
-- Duplicate mass-file paths are de-duplicated while keeping order.
-- --params and --database are required and each accepts only one value (unless --input-pin is set).
-- --init-weights/--percolator-psms/--percolator-peptides:
-  - 1 value => broadcast to all resolved mass files
-  - N values => 1:1 mapping with resolved mass-file count
-- In novel mode (--novel_protein/--novel_peptide/--internal_novel_peptide):
-  - if multiple mass files are resolved, ProtCosmo calls CometPlus once with all inputs.
+- If --input_tsv is provided (and --input-pin is not):
+  - --mass-file is not allowed.
+  - TSV must have a header and required column: mass-file.
+  - Optional TSV columns: params, database, init-weights, percolator-psms, percolator-peptides.
+  - Header matching is case-insensitive; dash/underscore aliases are accepted.
+  - Unknown columns are ignored.
+  - mass-file cell must be one file path (not comma list, not list-file, not directory).
+  - CLI scoring refs (--init-weights/--percolator-psms/--percolator-peptides) override TSV values globally.
+  - Effective params/database must each resolve to one unique value across rows.
+  - Each mass-file basename key must be unique across rows.
+  - All TSV mass files are merged into one CometPlus run input.
+- Else (no --input_tsv):
+  - Resolve --mass-file into one or more concrete spectrum files.
+  - Supported --mass-file styles:
+    - single mass spectrum file
+    - comma-separated list of files
+    - text file, one mass-file path per line (blank lines and # comments ignored)
+    - directory (all CometPlus-supported files in that directory are used)
+  - CometPlus-supported suffixes recognized by ProtCosmo include:
+    .mgf, .mgf.gz, .mzML, .mzML.gz, .mzMLb, .mzXML, .mzXML.gz, .raw, .ms2, .cms2, .bms2
+  - Duplicate mass-file paths are de-duplicated while keeping order.
+  - --params and --database are required and each accepts only one value.
+- CLI --init-weights/--percolator-psms/--percolator-peptides each accept only one value.
 - Scan-filter gating:
   - --scan/--scan_numbers/--first-scan/--last-scan are applied only when final run count is 1
   - when run count > 1, scan filters are ignored and warning is logged
@@ -144,6 +162,11 @@ Step 3. Static scoring from --init-weights
   (header -> normalized row -> raw row), ProtCosmo uses raw rows 2, 4, and 6.
 - For each selected row/model: score_k = w_k^T x + b_k  (b_k is column m0)
 - Final candidate score: final_score = mean(score_1, score_2, score_3)
+- In --input_tsv mode:
+  - with one effective init-weights: score merged PIN normally;
+  - with multiple init-weights: split merged PIN by SpecId key
+    using `SpecId.rsplit('_', maxsplit=3)[0]` and score each group independently;
+  - each unique init-weights must map to exactly one percolator-psms and one percolator-peptides.
 
 Step 4. Select winner per spectrum
 - Winner selection per spectrum:
@@ -165,6 +188,11 @@ Step 6. Write outputs
 - <output-prefix>.nove.psms.tsv
 - <output-prefix>.novel.peptides.tsv
 - optional: <output-prefix>.log (when --log is set)
+- Output proteinIds remap:
+  - COMETPLUS_NOVEL_* IDs are mapped to real protein_id values from:
+    1) --internal_novel_peptide when provided
+    2) otherwise <output-dir>/<output-prefix>.internal_novel_peptide.tsv
+  - Unmapped COMETPLUS_NOVEL_* tokens are kept and logged as warnings.
 
 Option details and format examples:
 
@@ -245,7 +273,7 @@ Option details and format examples:
 - Applied only when exactly one mass-file run is resolved.
 
 --init-weights <file>
-- Percolator weight file used to score Comet PIN candidates.
+- Percolator weight file used to score Comet PIN candidates (single CLI value only).
 - Expected shape: header row with feature names (must include m0), then numeric rows.
 - ProtCosmo prefers raw-weight rows (commonly numeric rows 2, 4, and 6).
 
@@ -253,6 +281,15 @@ Option details and format examples:
 - Skip CometPlus and directly score this PIN.
 - Requires: --init-weights, --percolator-psms, --percolator-peptides.
 - --mass-file/--params/--database are not required in this mode.
+
+--input_tsv <file>
+- Optional row table mode.
+- Required column: mass-file.
+- Optional columns: params, database, init-weights, percolator-psms, percolator-peptides.
+- Header order does not matter; aliases are accepted (case-insensitive, dash/underscore).
+- Unknown columns are ignored.
+- In this mode, --mass-file is not allowed.
+- CLI scoring refs override TSV scoring columns globally.
 
 --stop-after-cometplus
 - Run CometPlus and stop before scoring.
@@ -302,21 +339,30 @@ def build_parser() -> argparse.ArgumentParser:
             "  2) comma-separated files\n"
             "  3) text file, one mass-file path per line (# comment lines allowed)\n"
             "  4) directory; all supported files in that directory are used\n"
-            "Required unless --input-pin is set."
+            "Required unless --input-pin or --input_tsv is set."
+        ),
+    )
+    run_group.add_argument(
+        "--input_tsv",
+        help=(
+            "row-based TSV input table mode.\n"
+            "Required column: mass-file.\n"
+            "Optional columns: params, database, init-weights, percolator-psms, percolator-peptides.\n"
+            "In this mode, --mass-file is not allowed."
         ),
     )
     run_group.add_argument(
         "--params",
         help=(
             "Comet params file path (single value only).\n"
-            "Required unless --input-pin is set."
+            "Required unless --input-pin is set, or provided by --input_tsv rows."
         ),
     )
     run_group.add_argument(
         "--database",
         help=(
             "known database file path for CometPlus --database (single value only).\n"
-            "Required unless --input-pin is set."
+            "Required unless --input-pin is set, or provided by --input_tsv rows."
         ),
     )
     run_group.add_argument(
@@ -468,17 +514,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--init-weights",
         dest="init_weights",
         help=(
-            "Percolator weight file(s) used to score PIN candidates.\n"
+            "Percolator weight file used to score PIN candidates (single CLI value).\n"
             "ProtCosmo prefers raw-weight rows (commonly 2/4/6), applies score=w^T x + b, "
             "and averages the three scores.\n"
-            "One value may be broadcast, or provide comma-separated values matching --mass-file count."
+            "For per-mass-file variation, use --input_tsv rows."
         ),
     )
     score_group.add_argument(
         "--percolator-psms",
         dest="percolator_psms",
         help=(
-            "target PSM reference table(s) for q-value/PEP estimation (TSV or Parquet).\n"
+            "target PSM reference table for q-value/PEP estimation (TSV or Parquet, single CLI value).\n"
             "Table must contain score, q-value, and PEP columns (name variants accepted)."
         ),
     )
@@ -486,7 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--percolator-peptides",
         dest="percolator_peptides",
         help=(
-            "target peptide reference table(s) for q-value/PEP estimation (TSV or Parquet).\n"
+            "target peptide reference table for q-value/PEP estimation (TSV or Parquet, single CLI value).\n"
             "Table must contain score, q-value, and PEP columns (name variants accepted)."
         ),
     )
@@ -551,11 +597,72 @@ def _join_unique_csv(tokens: Sequence[str]) -> str:
     return ",".join(ordered)
 
 
-def _protein_ids_csv_from_text(proteins_text: str) -> str:
-    return _join_unique_csv(split_proteins(proteins_text))
+def _is_novel_token(token: str) -> bool:
+    text = str(token).strip()
+    if text.startswith(DECOY_PREFIX):
+        text = text[len(DECOY_PREFIX) :]
+    return text.startswith(NOVEL_PREFIX)
 
 
-def _make_psm_output_table(novel_psms: pd.DataFrame) -> pd.DataFrame:
+def _load_internal_novel_protein_map(path: Path) -> Dict[str, List[str]]:
+    table = pd.read_csv(path, sep="\t", comment="#", dtype=str)
+    if "peptide_id" not in table.columns or "protein_id" not in table.columns:
+        raise ValueError(
+            f"Internal novel peptide file is missing required columns in {path}: peptide_id, protein_id"
+        )
+
+    mapping: Dict[str, List[str]] = {}
+    for peptide_id, protein_text in zip(table["peptide_id"], table["protein_id"]):
+        key = "" if peptide_id is None else str(peptide_id).strip()
+        if not key:
+            continue
+        tokens = split_proteins("" if protein_text is None else str(protein_text))
+        if not tokens:
+            continue
+        existing = mapping.get(key, [])
+        mapping[key] = [token for token in _join_unique_csv(existing + tokens).split(",") if token]
+    return mapping
+
+
+def _protein_ids_csv_from_text(
+    proteins_text: str,
+    *,
+    peptide_to_proteins: Optional[Dict[str, List[str]]] = None,
+    missing_novel_ids: Optional[set[str]] = None,
+) -> str:
+    tokens = split_proteins(proteins_text)
+    if not tokens:
+        return ""
+    if not peptide_to_proteins:
+        return _join_unique_csv(tokens)
+
+    remapped: List[str] = []
+    for token in tokens:
+        text = str(token).strip()
+        is_decoy = False
+        core = text
+        if core.startswith(DECOY_PREFIX):
+            is_decoy = True
+            core = core[len(DECOY_PREFIX) :]
+        if core in peptide_to_proteins:
+            mapped = peptide_to_proteins[core]
+            if is_decoy:
+                remapped.extend([f"{DECOY_PREFIX}{item}" for item in mapped])
+            else:
+                remapped.extend(mapped)
+            continue
+        if missing_novel_ids is not None and _is_novel_token(text):
+            missing_novel_ids.add(core)
+        remapped.append(text)
+    return _join_unique_csv(remapped)
+
+
+def _make_psm_output_table(
+    novel_psms: pd.DataFrame,
+    *,
+    peptide_to_proteins: Optional[Dict[str, List[str]]] = None,
+    missing_novel_ids: Optional[set[str]] = None,
+) -> pd.DataFrame:
     columns = ["PSMId", "score", "q-value", "posterior_error_prob", "peptide", "proteinIds"]
     if novel_psms.empty:
         return pd.DataFrame(columns=columns)
@@ -567,7 +674,13 @@ def _make_psm_output_table(novel_psms: pd.DataFrame) -> pd.DataFrame:
             "q-value": pd.to_numeric(novel_psms["estimated_psm_q_value"], errors="coerce"),
             "posterior_error_prob": pd.to_numeric(novel_psms["estimated_psm_pep"], errors="coerce"),
             "peptide": novel_psms["modified_peptide"].astype(str),
-            "proteinIds": novel_psms["Proteins"].astype(str).map(_protein_ids_csv_from_text),
+            "proteinIds": novel_psms["Proteins"].astype(str).map(
+                lambda text: _protein_ids_csv_from_text(
+                    text,
+                    peptide_to_proteins=peptide_to_proteins,
+                    missing_novel_ids=missing_novel_ids,
+                )
+            ),
         }
     )
     output = output.sort_values(by=["score", "PSMId"], ascending=[False, True], na_position="last")
@@ -602,7 +715,12 @@ def _compute_peptide_estimates(novel_psms: pd.DataFrame, lookup_cache: Dict[str,
     return novel_psms
 
 
-def _make_modified_summary(novel_psms: pd.DataFrame) -> pd.DataFrame:
+def _make_modified_summary(
+    novel_psms: pd.DataFrame,
+    *,
+    peptide_to_proteins: Optional[Dict[str, List[str]]] = None,
+    missing_novel_ids: Optional[set[str]] = None,
+) -> pd.DataFrame:
     """Build reference-style peptide table with one highest-score row per peptide."""
 
     columns = ["PSMId", "score", "q-value", "posterior_error_prob", "peptide", "proteinIds"]
@@ -616,7 +734,13 @@ def _make_modified_summary(novel_psms: pd.DataFrame) -> pd.DataFrame:
             "q-value": pd.to_numeric(novel_psms["estimated_peptide_q_value"], errors="coerce"),
             "posterior_error_prob": pd.to_numeric(novel_psms["estimated_peptide_pep"], errors="coerce"),
             "peptide": novel_psms["modified_peptide"].astype(str),
-            "proteinIds": novel_psms["Proteins"].astype(str).map(_protein_ids_csv_from_text),
+            "proteinIds": novel_psms["Proteins"].astype(str).map(
+                lambda text: _protein_ids_csv_from_text(
+                    text,
+                    peptide_to_proteins=peptide_to_proteins,
+                    missing_novel_ids=missing_novel_ids,
+                )
+            ),
             "_final_score": pd.to_numeric(novel_psms["final_score"], errors="coerce"),
         }
     )
@@ -750,6 +874,27 @@ def _score_winner_rows_from_pin(
         )
 
     pin_df = read_pin(pin_path)
+    return _score_winner_rows_from_df(
+        run=run,
+        pin_df=pin_df,
+        model_cache=model_cache,
+        psm_lookup_cache=psm_lookup_cache,
+        warnings=warnings,
+    )
+
+
+def _score_winner_rows_from_df(
+    run,
+    pin_df: pd.DataFrame,
+    model_cache: Dict[str, object],
+    psm_lookup_cache: Dict[str, object],
+    warnings: List[str],
+) -> pd.DataFrame:
+    if run.init_weights is None or run.percolator_psms is None or run.percolator_peptides is None:
+        raise RuntimeError(
+            f"Run {run.run_index}: scoring references are missing "
+            "(init-weights/percolator-psms/percolator-peptides)."
+        )
 
     models = _lookup_cache_get(model_cache, run.init_weights, parse_selected_models)
     validate_models_feature_alignment(models)
@@ -794,6 +939,63 @@ def _score_winner_rows_from_pin(
     winners["percolator_peptides_file"] = run.percolator_peptides
     winners["protein_ids"] = winners["Proteins"].astype(str).map(_protein_ids_csv_from_text)
     return winners
+
+
+def _score_winner_rows_for_tsv_groups(
+    run,
+    pin_path: Path,
+    config,
+    model_cache: Dict[str, object],
+    psm_lookup_cache: Dict[str, object],
+    warnings: List[str],
+) -> List[pd.DataFrame]:
+    pin_df = read_pin(pin_path).copy()
+    pin_df["__input_file_key"] = pin_df["SpecId"].astype(str).map(extract_input_file_key)
+    winners_parts: List[pd.DataFrame] = []
+
+    for group in config.scoring_groups:
+        subset = pin_df[pin_df["__input_file_key"].isin(set(group.mass_file_keys))].drop(
+            columns=["__input_file_key"]
+        )
+        if subset.empty:
+            warnings.append(
+                f"Run {run.run_index}.{group.group_index}: no PIN rows matched "
+                f"input-file keys for init-weights {group.init_weights}."
+            )
+            continue
+
+        run_proxy = SimpleNamespace(
+            run_index=f"{run.run_index}.{group.group_index}",
+            row_index=run.row_index,
+            mass_file=",".join(group.mass_files),
+            params=run.params,
+            database=run.database,
+            init_weights=group.init_weights,
+            percolator_psms=group.percolator_psms,
+            percolator_peptides=group.percolator_peptides,
+        )
+        winners_parts.append(
+            _score_winner_rows_from_df(
+                run=run_proxy,
+                pin_df=subset,
+                model_cache=model_cache,
+                psm_lookup_cache=psm_lookup_cache,
+                warnings=warnings,
+            )
+        )
+
+    return winners_parts
+
+
+def _resolve_internal_novel_mapping_path(config, output_dir: Path, output_prefix: str) -> Path:
+    if config.internal_novel_peptide:
+        candidate = Path(str(config.internal_novel_peptide)).expanduser()
+        if not candidate.is_absolute():
+            candidate = (Path.cwd() / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        return candidate
+    return (output_dir / f"{output_prefix}.internal_novel_peptide.tsv").resolve()
 
 
 def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
@@ -852,14 +1054,26 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
                     continue
                 if result.pin_path is None:
                     raise RuntimeError(f"Run {run.run_index}: CometPlus PIN output path is missing.")
-                winners = _score_winner_rows_from_pin(
-                    run=run,
-                    pin_path=result.pin_path,
-                    model_cache=model_cache,
-                    psm_lookup_cache=psm_lookup_cache,
-                    warnings=warnings,
-                )
-                all_winners_parts.append(winners)
+                if config.use_input_tsv and len(config.scoring_groups) > 1:
+                    all_winners_parts.extend(
+                        _score_winner_rows_for_tsv_groups(
+                            run=run,
+                            pin_path=result.pin_path,
+                            config=config,
+                            model_cache=model_cache,
+                            psm_lookup_cache=psm_lookup_cache,
+                            warnings=warnings,
+                        )
+                    )
+                else:
+                    winners = _score_winner_rows_from_pin(
+                        run=run,
+                        pin_path=result.pin_path,
+                        model_cache=model_cache,
+                        psm_lookup_cache=psm_lookup_cache,
+                        warnings=warnings,
+                    )
+                    all_winners_parts.append(winners)
 
         if stop_after_any:
             for warning in warnings:
@@ -885,13 +1099,44 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
                 "assigned peptide q-value=1 and PEP=1."
             )
 
+        peptide_to_proteins: Dict[str, List[str]] = {}
+        missing_novel_ids: set[str] = set()
+        contains_novel_tokens = (
+            novel_psms["Proteins"].astype(str).str.contains(NOVEL_PREFIX, regex=False).any()
+            if not novel_psms.empty
+            else False
+        )
+        if contains_novel_tokens:
+            mapping_path = _resolve_internal_novel_mapping_path(config, output_dir, output_prefix)
+            if mapping_path.exists():
+                peptide_to_proteins = _load_internal_novel_protein_map(mapping_path)
+            else:
+                warnings.append(
+                    "Unable to remap COMETPLUS_NOVEL_* protein IDs because mapping file is missing: "
+                    f"{mapping_path}"
+                )
+
+        modified_summary = _make_modified_summary(
+            novel_psms,
+            peptide_to_proteins=peptide_to_proteins,
+            missing_novel_ids=missing_novel_ids,
+        )
+        novel_psms_out = _make_psm_output_table(
+            novel_psms,
+            peptide_to_proteins=peptide_to_proteins,
+            missing_novel_ids=missing_novel_ids,
+        )
+
+        if missing_novel_ids:
+            warnings.append(
+                "Unmapped COMETPLUS_NOVEL peptide_id values were kept in output proteinIds: "
+                + ",".join(sorted(missing_novel_ids))
+            )
+
         for warning in warnings:
             text = str(warning).strip()
             if text:
                 logger.warning(text)
-
-        modified_summary = _make_modified_summary(novel_psms)
-        novel_psms_out = _make_psm_output_table(novel_psms)
 
         output_paths["novel_psms"] = str((output_dir / f"{output_prefix}.nove.psms.tsv").resolve())
         output_paths["novel_peptides_modified"] = str((output_dir / f"{output_prefix}.novel.peptides.tsv").resolve())
@@ -917,13 +1162,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.help_full:
         _print_full_help(parser)
         return 0
-    if any(arg == "--input_tsv" or str(arg).startswith("--input_tsv=") for arg in passthrough_args):
-        print(
-            "ERROR: --input_tsv is no longer supported. "
-            "Use --mass-file with one of: single file, comma list, list file, or directory.",
-            file=sys.stderr,
-        )
-        return 1
     try:
         outputs = run_pipeline(args, passthrough_args)
     except Exception as exc:  # pylint: disable=broad-exception-caught

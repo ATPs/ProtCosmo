@@ -9,6 +9,7 @@ from typing import Dict, Iterable, Tuple
 import numpy as np
 import pandas as pd
 
+from .input_key import extract_input_file_key
 
 SCORE_CANDIDATES = ("score", "mokapot_score", "mokapot score")
 QVALUE_CANDIDATES = ("q-value", "q_value", "mokapot q-value", "mokapot_q_value")
@@ -100,7 +101,7 @@ def _normalize_reference_table(path: Path, table: pd.DataFrame) -> pd.DataFrame:
         psm_id_col = _find_column(table.columns, PSMID_CANDIDATES)
         psm_id_series = table[psm_id_col].astype(str)
         normalized["psm_id"] = psm_id_series
-        normalized["input_file_key"] = psm_id_series.str.split("_", n=1).str[0]
+        normalized["input_file_key"] = psm_id_series.map(extract_input_file_key)
     except ValueError:
         pass
 

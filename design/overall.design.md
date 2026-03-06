@@ -7,10 +7,11 @@ This document describes the current runtime behavior implemented in:
 
 ## 1. Goal
 
-ProtCosmo is a CLI pipeline with two execution paths:
+ProtCosmo is a CLI pipeline with three configuration paths:
 
-1. CometPlus path: resolve mass-spectrum input(s), run CometPlus, score PIN candidates, pick winner PSMs, estimate q/PEP, and export reports.
-2. Direct PIN path (`--input-pin`): skip CometPlus and score an existing PIN directly.
+1. CometPlus path (`--mass-file`): resolve mass-spectrum input(s), run CometPlus, score PIN candidates, pick winner PSMs, estimate q/PEP, and export reports.
+2. TSV path (`--input_tsv`): load row-based mass/scoring metadata, run one merged CometPlus search, then score with one or multiple init-weight groups.
+3. Direct PIN path (`--input-pin`): skip CometPlus and score an existing PIN directly.
 
 It also supports early-stop modes:
 
@@ -25,7 +26,7 @@ Early-stop modes stop before scoring outputs.
 
 1. Build parser.
 2. Parse known args; unknown args become `passthrough_args`.
-3. Reject legacy `--input_tsv` passthrough usage.
+3. `--help-full` prints detailed help text.
 4. Call `run_pipeline(args, passthrough_args)`.
 
 ## Step 1: Normalize runtime config (`utils.config_loader.load_pipeline_config`)
@@ -37,39 +38,56 @@ Early-stop modes stop before scoring outputs.
    - `--force`
    - `--log`
    - `--input-pin`
+   - `--input_tsv`
 3. Validate mode conflicts:
    - stop-after flags are mutually exclusive;
    - `--input-pin` cannot combine with stop-after flags.
 4. If `--input-pin` is set:
    - resolve to absolute path;
-   - require scoring references (`--init-weights`, `--percolator-psms`, `--percolator-peptides`);
+   - require scoring references (`--init-weights`, `--percolator-psms`, `--percolator-peptides`), each single CLI value;
    - create one `RunConfig` using this PIN.
-5. Else (CometPlus path):
-   - resolve `--mass-file` inputs;
+   - If `--input_tsv` is also provided, input-pin mode wins and TSV rows are ignored.
+5. Else if `--input_tsv` is set:
+   - reject simultaneous `--mass-file`;
+   - parse TSV with header required;
+   - required column: `mass-file`;
+   - optional columns: `params`, `database`, `init-weights`, `percolator-psms`, `percolator-peptides`;
+   - header matching is case-insensitive and accepts dash/underscore aliases;
+   - unknown columns are ignored.
+6. TSV mode row handling:
+   - each `mass-file` cell must be one file path (no comma/list-file/directory semantics);
+   - resolve paths;
+   - derive per-row mass key from basename without suffix;
+   - fail on mass-key collisions;
+   - apply CLI override for scoring refs (`--init-weights`, `--percolator-psms`, `--percolator-peptides`), each single CLI value;
+   - resolve effective `params`/`database` and require one unique value each across rows;
+   - scoring refs are required unless stop-after mode.
+7. TSV scoring groups:
+   - group rows by effective `init-weights`;
+   - each unique init-weights must map to exactly one `percolator-psms` and one `percolator-peptides`;
+   - emit one merged run containing all TSV mass files.
+8. Else (standard `--mass-file` mode):
+   - resolve mass files via resolver (single/comma/list-file/directory);
    - detect novel mode if any of `--novel_protein`, `--novel_peptide`, `--internal_novel_peptide` is set;
    - merge multi-file novel inputs into one run;
-   - require single-value `--params` and `--database`.
-6. Scoring references are optional in stop-after modes, required otherwise.
-7. If scan filters are provided with multi-run mode, disable scan filters and append a warning.
+   - require single-value `--params`, `--database`;
+   - require single-value scoring refs unless stop-after mode.
+9. Scan-filter gating:
+   - if final run count > 1 and scan args are present, disable scan filters and append warning.
 
-Output is `PipelineConfig` with normalized runs and runtime booleans (`force`, `log`).
+Output is `PipelineConfig` with normalized runs and runtime booleans (`force`, `log`, `use_input_tsv`) and optional TSV scoring group metadata.
 
-## Step 1.1: Mass-file resolution (`utils.mass_file_resolver`)
+## Step 1.1: Shared input key extraction
 
-`--mass-file` supports:
+`utils.input_key.extract_input_file_key(spec_id)` is used across pipeline components and follows:
 
-1. Single file.
-2. Comma-separated list.
-3. Directory scan for supported suffixes.
-4. List file (one path per line; `#` comments allowed).
+- `str(spec_id).rsplit("_", maxsplit=3)[0]`
 
-Resolver behavior:
+This keeps key derivation consistent for:
 
-1. Resolve relative paths.
-2. Validate existence.
-3. Keep supported spectrum formats for directory mode.
-4. De-duplicate while preserving order.
-5. For ambiguous text files, attempt list parsing then fallback to direct path.
+1. Winner row partition keys (`selection.py`).
+2. Reference partition keys from `PSMId` (`percolator_ref.py`).
+3. TSV grouped split of merged PIN rows.
 
 ## Step 2: Initialize run context (`protcosmo.run_pipeline`)
 
@@ -104,18 +122,21 @@ For each run:
 ## Step 4: Score input source
 
 1. Input-pin mode: score provided PIN directly.
-2. CometPlus mode: score returned PIN per run (unless stop-after mode).
+2. CometPlus mode:
+   - normal: score returned PIN directly;
+   - TSV mode with one scoring group: same as normal;
+   - TSV mode with multiple init-weight groups: split merged PIN by `input_file_key` and score each group independently.
 
 ## Step 5: Scoring and winner selection
 
-Per run:
+Per scoring batch:
 
-1. Read PIN (`.pin`, `.pin.gz`, `.parquet`, `.parquet.gz`).
+1. Read PIN (`.pin`, `.pin.gz`, `.parquet`, `.parquet.gz`) into DataFrame.
 2. Parse selected Percolator models from weights (raw rows like 2/4/6).
 3. Score all candidates with linear models and average into `final_score`.
 4. Select one winner PSM per spectrum.
 5. Estimate PSM q/PEP by nearest smaller-or-equal lookup against `--percolator-psms` (partition-aware by input key).
-6. Collect winner tables across runs.
+6. Collect winner tables across runs/groups.
 
 ## Step 6: Early-stop behavior
 
@@ -125,7 +146,7 @@ If `stop_after_any` is true:
 2. Print collected warnings to screen (and log file when enabled).
 3. Return outputs map (empty unless `--log` was set).
 
-## Step 7: Novel subset and peptide/protein summaries
+## Step 7: Novel subset, peptide estimation, and protein-id remap
 
 Normal mode only:
 
@@ -133,10 +154,16 @@ Normal mode only:
 2. Keep `novel_only` winners.
 3. Build modified/unmodified peptide forms and novel protein IDs.
 4. Estimate peptide q/PEP from `--percolator-peptides`.
-5. Build:
+5. Build peptide-id to protein-id mapping source:
+   - `--internal_novel_peptide` if provided;
+   - otherwise `<output-dir>/<output-prefix>.internal_novel_peptide.tsv`.
+6. Remap output protein IDs:
+   - replace `COMETPLUS_NOVEL_*` tokens with mapped real `protein_id` value(s);
+   - dedupe and join with comma;
+   - if mapping file missing or peptide_id unmapped, keep original token and emit warning.
+7. Build:
    - PSM output table (reference-style columns),
    - modified peptide summary table.
-6. Internal unmodified/protein summaries are computed for runtime consistency, but not exported as files.
 
 ## Step 8: Outputs
 
@@ -170,4 +197,5 @@ ProtCosmo no longer writes these files:
 3. Novel PIN skip/reuse check uses exactly `<output-prefix>.cometplus.novel.pin`.
 4. q-value/PEP values are lookup estimates (not retrained Percolator outputs).
 5. Output score fields come from matched reference-score lookup values.
-6. Caches are reused across runs to avoid duplicate model/reference loads.
+6. Caches are reused across runs/groups to avoid duplicate model/reference loads.
+7. CLI scoring refs are single-value options; per-mass-file scoring variation uses `--input_tsv`.
