@@ -5,6 +5,15 @@ This document describes the current runtime behavior implemented in:
 - `src/protcosmo/protcosmo.py`
 - `src/protcosmo/utils/*`
 
+Runtime helper placement:
+
+- CLI long help text/formatter: `src/protcosmo/utils/help_text.py`
+- Runtime logger: `src/protcosmo/utils/runtime_logging.py`
+- Shared cache get-or-load helper: `src/protcosmo/utils/cache_utils.py`
+- Grouped scoring helpers: `src/protcosmo/utils/scoring_batches.py`
+- Novel-output remap/report table helpers: `src/protcosmo/utils/novel_reports.py`
+- `protcosmo.py` binds scoring helpers as direct aliases from `utils.scoring_batches` and keeps a thin grouped-scoring bridge for patch/test compatibility.
+
 ## 1. Goal
 
 ProtCosmo is a CLI pipeline with three configuration paths:
@@ -125,7 +134,8 @@ For each run:
 2. CometPlus mode:
    - normal: score returned PIN directly;
    - TSV mode with one scoring group: same as normal;
-   - TSV mode with multiple init-weight groups: split merged PIN by `input_file_key` and score each group independently.
+   - TSV mode with multiple init-weight groups: split merged PIN by `input_file_key` and score each group independently;
+   - grouped scoring parallelism: if `--thread > 1`, run groups in parallel with up to `min(--thread, matched_group_count)` workers.
 
 ## Step 5: Scoring and winner selection
 
@@ -137,6 +147,7 @@ Per scoring batch:
 4. Select one winner PSM per spectrum.
 5. Estimate PSM q/PEP by nearest smaller-or-equal lookup against `--percolator-psms` (partition-aware by input key).
 6. Collect winner tables across runs/groups.
+7. For parallel grouped scoring, collect per-group warnings and append them in group index order for stable output.
 
 ## Step 6: Early-stop behavior
 
@@ -199,3 +210,4 @@ ProtCosmo no longer writes these files:
 5. Output score fields come from matched reference-score lookup values.
 6. Caches are reused across runs/groups to avoid duplicate model/reference loads.
 7. CLI scoring refs are single-value options; per-mass-file scoring variation uses `--input_tsv`.
+8. `--thread` controls both CometPlus `num_threads` forwarding and parallel worker count for multi-group TSV scoring.

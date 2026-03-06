@@ -4,12 +4,11 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import sys
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Dict, List, Optional, Sequence, TextIO
+from typing import Dict, List, Sequence
 
-import numpy as np
 import pandas as pd
 
 if __package__ in (None, ""):
@@ -20,293 +19,77 @@ if __package__ in (None, ""):
     from protcosmo import __version__  # type: ignore
     from protcosmo.utils.comet_runner import run_cometplus_search  # type: ignore
     from protcosmo.utils.config_loader import load_pipeline_config  # type: ignore
-    from protcosmo.utils.input_key import extract_input_file_key  # type: ignore
+    from protcosmo.utils.help_text import (  # type: ignore
+        FULL_HELP_TEXT,
+        ProtCosmoHelpFormatter,
+        SHORT_DESCRIPTION,
+        SHORT_EPILOG,
+        print_full_help as _print_full_help,
+    )
+    from protcosmo.utils.novel_reports import (  # type: ignore
+        NOVEL_PREFIX,
+        compute_peptide_estimates as _compute_peptide_estimates,
+        load_internal_novel_protein_map as _load_internal_novel_protein_map,
+        make_modified_summary as _make_modified_summary,
+        make_protein_summary as _make_protein_summary,
+        make_psm_output_table as _make_psm_output_table,
+        make_unmodified_summary as _make_unmodified_summary,
+        resolve_internal_novel_mapping_path as _resolve_internal_novel_mapping_path,
+    )
     from protcosmo.utils.peptide_utils import (  # type: ignore
         collapse_to_unmodified,
         normalize_modified_peptide,
     )
-    from protcosmo.utils.percolator_ref import build_partitioned_reference_lookup  # type: ignore
-    from protcosmo.utils.pin_reader import read_pin, split_proteins  # type: ignore
+    from protcosmo.utils.runtime_logging import PipelineLogger  # type: ignore
     from protcosmo.utils.report_writer import (  # type: ignore
         ensure_dir,
         write_tsv,
     )
-    from protcosmo.utils.scoring import score_pin_candidates  # type: ignore
-    from protcosmo.utils.selection import (  # type: ignore
-        get_novel_protein_ids,
-        select_best_psm_per_spectrum,
-    )
-    from protcosmo.utils.weights_parser import (  # type: ignore
-        parse_selected_models,
-        validate_models_feature_alignment,
-    )
+    from protcosmo.utils import scoring_batches as _scoring_batches  # type: ignore
+    from protcosmo.utils.selection import get_novel_protein_ids  # type: ignore
 else:
     from . import __version__
     from .utils.comet_runner import run_cometplus_search
     from .utils.config_loader import load_pipeline_config
-    from .utils.input_key import extract_input_file_key
+    from .utils.help_text import (
+        FULL_HELP_TEXT,
+        ProtCosmoHelpFormatter,
+        SHORT_DESCRIPTION,
+        SHORT_EPILOG,
+        print_full_help as _print_full_help,
+    )
+    from .utils.novel_reports import (
+        NOVEL_PREFIX,
+        compute_peptide_estimates as _compute_peptide_estimates,
+        load_internal_novel_protein_map as _load_internal_novel_protein_map,
+        make_modified_summary as _make_modified_summary,
+        make_protein_summary as _make_protein_summary,
+        make_psm_output_table as _make_psm_output_table,
+        make_unmodified_summary as _make_unmodified_summary,
+        resolve_internal_novel_mapping_path as _resolve_internal_novel_mapping_path,
+    )
     from .utils.peptide_utils import collapse_to_unmodified, normalize_modified_peptide
-    from .utils.percolator_ref import build_partitioned_reference_lookup
-    from .utils.pin_reader import read_pin, split_proteins
+    from .utils.runtime_logging import PipelineLogger
     from .utils.report_writer import ensure_dir, write_tsv
-    from .utils.scoring import score_pin_candidates
-    from .utils.selection import get_novel_protein_ids, select_best_psm_per_spectrum
-    from .utils.weights_parser import parse_selected_models, validate_models_feature_alignment
+    from .utils import scoring_batches as _scoring_batches
+    from .utils.selection import get_novel_protein_ids
 
 
-ESTIMATION_NOTE = (
-    "q-value and PEP are estimated by score lookup from reference Percolator outputs. "
-    "Real q-value/PEP are expected to be smaller than the estimated values."
-)
-NOVEL_PREFIX = "COMETPLUS_NOVEL_"
-DECOY_PREFIX = "DECOY_"
+_score_winner_rows_from_pin = _scoring_batches.score_winner_rows_from_pin
+_score_winner_rows_from_df = _scoring_batches.score_winner_rows_from_df
+_resolve_tsv_group_worker_count = _scoring_batches.resolve_tsv_group_worker_count
 
 
-class ProtCosmoHelpFormatter(argparse.RawTextHelpFormatter):
-    """Help formatter with wider layout for readable multiline option docs."""
-
-    def __init__(self, prog: str) -> None:
-        super().__init__(prog, max_help_position=36, width=118)
-
-
-SHORT_DESCRIPTION = """
-ProtCosmo runs CometPlus searches, statically re-scores PIN candidates with Percolator weights,
-selects one winner PSM per spectrum, and reports novel-only findings.
-
-Use --help-full for step-by-step workflow, file-format details, and examples.
-""".strip()
-
-
-SHORT_EPILOG = f"""
-Quick format notes:
-- --input-pin: skip CometPlus and score directly from this PIN file.
-- --input_tsv: row-based input table mode (required column: mass-file).
-- --mass-file supports: single file, comma list, list file (one path per line), or directory.
-- --input_tsv and --mass-file cannot be used together.
-- --input-pin takes precedence when both --input-pin and --input_tsv are provided.
-- --params and --database each accept only one value (required unless --input-pin is set, or set via --input_tsv rows).
-- --init-weights/--percolator-psms/--percolator-peptides each accept one CLI value.
-- In --input_tsv mode, per-mass-file scoring variation is configured from TSV rows.
-- --output-dir is also forwarded to CometPlus as --output-folder.
-- --output-prefix controls ProtCosmo-generated output filename prefix (default: protcosmo).
-- --log: also write runtime logs/warnings to <output-dir>/<output-prefix>.log.
-- --force: overwrite existing <output-prefix>.cometplus.novel.pin in novel mode.
-- --run-comet-each is forwarded to CometPlus by default.
-- --stop-after-cometplus: run CometPlus then stop (no scoring/reporting).
-- --novel_protein: FASTA input.
-- --novel_peptide: FASTA or tokenized text (comma/space/tab/newline delimiters).
-- --output_internal_novel_peptide: auto-enabled in novel mode as `--output-dir/<output-prefix>.internal_novel_peptide.tsv`.
-- --internal_novel_peptide: reuse previously exported internal novel TSV.
-- --stop-after-saving-novel-peptide: stop after TSV export, skip search/scoring in ProtCosmo.
-- --keep-tmp: keep CometPlus temporary files.
-- --scan/--scan_numbers/--first-scan/--last-scan: only applied when exactly one run is resolved.
-
-{ESTIMATION_NOTE}
-""".strip()
-
-
-FULL_HELP_TEXT = f"""
-Detailed workflow:
-
-Step 1. Build run configuration
-- If --input-pin is provided:
-  - ProtCosmo skips CometPlus and scores this PIN directly.
-  - --mass-file/--params/--database are not required.
-- If --input_tsv is provided (and --input-pin is not):
-  - --mass-file is not allowed.
-  - TSV must have a header and required column: mass-file.
-  - Optional TSV columns: params, database, init-weights, percolator-psms, percolator-peptides.
-  - Header matching is case-insensitive; dash/underscore aliases are accepted.
-  - Unknown columns are ignored.
-  - mass-file cell must be one file path (not comma list, not list-file, not directory).
-  - CLI scoring refs (--init-weights/--percolator-psms/--percolator-peptides) override TSV values globally.
-  - Effective params/database must each resolve to one unique value across rows.
-  - Each mass-file basename key must be unique across rows.
-  - All TSV mass files are merged into one CometPlus run input.
-- Else (no --input_tsv):
-  - Resolve --mass-file into one or more concrete spectrum files.
-  - Supported --mass-file styles:
-    - single mass spectrum file
-    - comma-separated list of files
-    - text file, one mass-file path per line (blank lines and # comments ignored)
-    - directory (all CometPlus-supported files in that directory are used)
-  - CometPlus-supported suffixes recognized by ProtCosmo include:
-    .mgf, .mgf.gz, .mzML, .mzML.gz, .mzMLb, .mzXML, .mzXML.gz, .raw, .ms2, .cms2, .bms2
-  - Duplicate mass-file paths are de-duplicated while keeping order.
-  - --params and --database are required and each accepts only one value.
-- CLI --init-weights/--percolator-psms/--percolator-peptides each accept only one value.
-- Scan-filter gating:
-  - --scan/--scan_numbers/--first-scan/--last-scan are applied only when final run count is 1
-  - when run count > 1, scan filters are ignored and warning is logged
-
-Step 2. Run CometPlus for each mass file
-- ProtCosmo builds a CometPlus command with:
-  --params, --database, --output-folder <output-dir>,
-  --output_percolatorfile 1, --max_duplicate_proteins -1
-- One run may include one or many spectrum input files.
-- Optional ProtCosmo-controlled options forwarded to CometPlus:
-  --novel_protein, --novel_peptide, --output_internal_novel_peptide,
-  --internal_novel_peptide, --stop-after-saving-novel-peptide,
-  --keep-tmp, --run-comet-each, --thread, scan filters (single-run only)
-- Unknown options are passed through to CometPlus unchanged.
-- CometPlus stdout/stderr are streamed to screen (and to <output-prefix>.log when --log is set).
-- PIN output is detected from generated .pin/.pin.gz/.pin.parquet(.gz)
-- In novel mode, if <output-prefix>.cometplus.novel.pin already exists:
-  - default: skip CometPlus and reuse this PIN
-  - with --force: rerun CometPlus and overwrite it
-- With --stop-after-cometplus, ProtCosmo stops after this step.
-
-Step 3. Static scoring from --init-weights
-- --init-weights is a Percolator weights file used for re-scoring PIN candidates.
-- For Percolator CV exports with repeated blocks
-  (header -> normalized row -> raw row), ProtCosmo uses raw rows 2, 4, and 6.
-- For each selected row/model: score_k = w_k^T x + b_k  (b_k is column m0)
-- Final candidate score: final_score = mean(score_1, score_2, score_3)
-- In --input_tsv mode:
-  - with one effective init-weights: score merged PIN normally;
-  - with multiple init-weights: split merged PIN by SpecId key
-    using `SpecId.rsplit('_', maxsplit=3)[0]` and score each group independently;
-  - each unique init-weights must map to exactly one percolator-psms and one percolator-peptides.
-
-Step 4. Select winner per spectrum
-- Winner selection per spectrum:
-  1) higher final_score wins
-  2) on score tie, non-novel winner is preferred over novel-only winner
-  3) if still tied, smaller SpecId rank wins
-- Novel-only means every protein ID in winner starts with COMETPLUS_NOVEL_
-
-Step 5. Estimate q-value/PEP by lookup
-- PSM-level estimate uses --percolator-psms.
-- Peptide-level estimate for novel winners uses --percolator-peptides.
-- Reference format: TSV or Parquet.
-- Required logical columns (name variants accepted):
-  score, q-value, posterior_error_prob/pep
-- Lookup rule: nearest smaller-or-equal score.
-- Fallback when no smaller score exists: q-value=1 and PEP=1 (warning logged).
-
-Step 6. Write outputs
-- <output-prefix>.nove.psms.tsv
-- <output-prefix>.novel.peptides.tsv
-- optional: <output-prefix>.log (when --log is set)
-- Output proteinIds remap:
-  - COMETPLUS_NOVEL_* IDs are mapped to real protein_id values from:
-    1) --internal_novel_peptide when provided
-    2) otherwise <output-dir>/<output-prefix>.internal_novel_peptide.tsv
-  - Unmapped COMETPLUS_NOVEL_* tokens are kept and logged as warnings.
-
-Option details and format examples:
-
---novel_protein <file>
-- FASTA input only.
-- Example:
-  >novel_protein_1
-  MPEPTIDEKQLA
-
---novel_peptide <file>
-- Two supported formats:
-  1) FASTA (auto-detected if any non-empty trimmed line starts with '>')
-  2) tokenized text (comma/space/tab/newline delimiters)
-- Tokenized mode normalization in CometPlus:
-  - keep alphabetic chars only
-  - convert to uppercase
-  - remove empty/duplicate tokens
-- Tokenized examples (valid):
-  PEPTIDEK,PEPTIDEL
-  PEPTIDEK PEPTIDEL
-  PEPTIDEK
-  PEPTIDEL
-  ACD[+57]EFG
-  K.PEPTIDE.R
-- Parsed examples become:
-  PEPTIDEK, PEPTIDEL, ACDEFG, KPEPTIDER
-
---output_internal_novel_peptide <file>
-- Forwarded directly to CometPlus.
-- CometPlus writes an internal TSV with columns: peptide, peptide_id, protein_id.
-- Default behavior in ProtCosmo:
-  - if --novel_protein or --novel_peptide is provided and this option is not set,
-    ProtCosmo auto-adds:
-    --output_internal_novel_peptide <output-dir>/<output-prefix>.internal_novel_peptide.tsv
-  - this path is shared across runs, so only one file version is kept.
-
---internal_novel_peptide <file>
-- Forwarded directly to CometPlus.
-- Reuse a previously exported internal TSV as novel peptide source.
-
---stop-after-saving-novel-peptide
-- Forwarded directly to CometPlus.
-- CometPlus exits after saving internal TSV.
-- In this mode, ProtCosmo does not run PIN scoring and does not write novel_psms/novel_peptides reports.
-- ProtCosmo still prints runtime logs/warnings to screen.
-
---keep-tmp
-- Forwarded directly to CometPlus.
-- Keep CometPlus temporary/intermediate files.
-
---run-comet-each / --no-run-comet-each
-- Forwarded directly to CometPlus as `--run-comet-each`.
-- Default in ProtCosmo: enabled.
-- Use `--no-run-comet-each` to disable forwarding this option.
-
---scan <file>
-- Text file of positive scan integers.
-- Delimiters: comma/space/tab/newline.
-- CometPlus only searches these scans.
-- ProtCosmo applies this only when exactly one mass-file run is resolved.
-
---scan_numbers <list>
-- Inline explicit scan list with same parser as --scan.
-- Example: 1001,1002,1003
-
---first-scan <num>
-- First/start scan number to search in CometPlus (same semantics as -F<num>).
-- Sets lower scan bound; can be used alone or with --last-scan.
-- Applies to novel peptide/protein searches and normal searches.
-- If --scan/--scan_numbers are also set, effective scans are intersection.
-- Applied only when exactly one mass-file run is resolved.
-
---last-scan <num>
-- Last/end scan number to search in CometPlus (same semantics as -L<num>).
-- Sets upper scan bound; can be used alone or with --first-scan.
-- Applies to novel peptide/protein searches and normal searches.
-- If --scan/--scan_numbers are also set, effective scans are intersection.
-- Applied only when exactly one mass-file run is resolved.
-
---init-weights <file>
-- Percolator weight file used to score Comet PIN candidates (single CLI value only).
-- Expected shape: header row with feature names (must include m0), then numeric rows.
-- ProtCosmo prefers raw-weight rows (commonly numeric rows 2, 4, and 6).
-
---input-pin <file>
-- Skip CometPlus and directly score this PIN.
-- Requires: --init-weights, --percolator-psms, --percolator-peptides.
-- --mass-file/--params/--database are not required in this mode.
-
---input_tsv <file>
-- Optional row table mode.
-- Required column: mass-file.
-- Optional columns: params, database, init-weights, percolator-psms, percolator-peptides.
-- Header order does not matter; aliases are accepted (case-insensitive, dash/underscore).
-- Unknown columns are ignored.
-- In this mode, --mass-file is not allowed.
-- CLI scoring refs override TSV scoring columns globally.
-
---stop-after-cometplus
-- Run CometPlus and stop before scoring.
-- ProtCosmo prints runtime logs/warnings to screen and exits.
-
---force
-- In novel mode, if `<output-prefix>.cometplus.novel.pin` already exists:
-  - default behavior is skip/reuse;
-  - with `--force`, ProtCosmo reruns CometPlus and overwrites that PIN.
-
---log
-- Also write runtime logs/warnings to:
-  `<output-dir>/<output-prefix>.log`
-
-Estimation warning:
-{ESTIMATION_NOTE}
-""".strip()
+def _score_winner_rows_for_tsv_groups(*args, **kwargs):
+    original_executor = _scoring_batches.ThreadPoolExecutor
+    original_score_df = _scoring_batches.score_winner_rows_from_df
+    _scoring_batches.ThreadPoolExecutor = ThreadPoolExecutor
+    _scoring_batches.score_winner_rows_from_df = _score_winner_rows_from_df
+    try:
+        return _scoring_batches.score_winner_rows_for_tsv_groups(*args, **kwargs)
+    finally:
+        _scoring_batches.ThreadPoolExecutor = original_executor
+        _scoring_batches.score_winner_rows_from_df = original_score_df
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -376,7 +159,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_group.add_argument(
         "--thread",
         type=int,
-        help="override CometPlus num_threads",
+        help=(
+            "override CometPlus num_threads.\n"
+            "In --input_tsv mode with multiple init-weight groups, this also controls "
+            "parallel scoring worker count."
+        ),
     )
     run_group.add_argument(
         "--keep-tmp",
@@ -538,464 +325,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
-
-
-def _print_full_help(parser: argparse.ArgumentParser) -> None:
-    parser.print_help()
-    print("")
-    print(FULL_HELP_TEXT)
-
-
-class PipelineLogger:
-    def __init__(self, log_path: Optional[Path]) -> None:
-        self.log_path = log_path
-        self._handle: Optional[TextIO] = None
-        if log_path is not None:
-            ensure_dir(log_path.parent)
-            self._handle = log_path.open("a", encoding="utf-8")
-
-    def close(self) -> None:
-        if self._handle is not None:
-            self._handle.close()
-            self._handle = None
-
-    def _emit(self, text: str, stream: TextIO) -> None:
-        if not text:
-            return
-        out = text if text.endswith("\n") else f"{text}\n"
-        stream.write(out)
-        stream.flush()
-        if self._handle is not None:
-            self._handle.write(out)
-            self._handle.flush()
-
-    def info(self, text: str) -> None:
-        self._emit(text, sys.stdout)
-
-    def stderr(self, text: str) -> None:
-        self._emit(text, sys.stderr)
-
-    def warning(self, text: str) -> None:
-        self._emit(f"WARNING: {text}", sys.stderr)
-
-
-def _lookup_cache_get(cache: Dict[str, object], key: str, loader):
-    if key not in cache:
-        cache[key] = loader(key)
-    return cache[key]
-
-
-def _join_unique_csv(tokens: Sequence[str]) -> str:
-    seen = set()
-    ordered: List[str] = []
-    for token in tokens:
-        text = str(token).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        ordered.append(text)
-    return ",".join(ordered)
-
-
-def _is_novel_token(token: str) -> bool:
-    text = str(token).strip()
-    if text.startswith(DECOY_PREFIX):
-        text = text[len(DECOY_PREFIX) :]
-    return text.startswith(NOVEL_PREFIX)
-
-
-def _load_internal_novel_protein_map(path: Path) -> Dict[str, List[str]]:
-    table = pd.read_csv(path, sep="\t", comment="#", dtype=str)
-    if "peptide_id" not in table.columns or "protein_id" not in table.columns:
-        raise ValueError(
-            f"Internal novel peptide file is missing required columns in {path}: peptide_id, protein_id"
-        )
-
-    mapping: Dict[str, List[str]] = {}
-    for peptide_id, protein_text in zip(table["peptide_id"], table["protein_id"]):
-        key = "" if peptide_id is None else str(peptide_id).strip()
-        if not key:
-            continue
-        tokens = split_proteins("" if protein_text is None else str(protein_text))
-        if not tokens:
-            continue
-        existing = mapping.get(key, [])
-        mapping[key] = [token for token in _join_unique_csv(existing + tokens).split(",") if token]
-    return mapping
-
-
-def _protein_ids_csv_from_text(
-    proteins_text: str,
-    *,
-    peptide_to_proteins: Optional[Dict[str, List[str]]] = None,
-    missing_novel_ids: Optional[set[str]] = None,
-) -> str:
-    tokens = split_proteins(proteins_text)
-    if not tokens:
-        return ""
-    if not peptide_to_proteins:
-        return _join_unique_csv(tokens)
-
-    remapped: List[str] = []
-    for token in tokens:
-        text = str(token).strip()
-        is_decoy = False
-        core = text
-        if core.startswith(DECOY_PREFIX):
-            is_decoy = True
-            core = core[len(DECOY_PREFIX) :]
-        if core in peptide_to_proteins:
-            mapped = peptide_to_proteins[core]
-            if is_decoy:
-                remapped.extend([f"{DECOY_PREFIX}{item}" for item in mapped])
-            else:
-                remapped.extend(mapped)
-            continue
-        if missing_novel_ids is not None and _is_novel_token(text):
-            missing_novel_ids.add(core)
-        remapped.append(text)
-    return _join_unique_csv(remapped)
-
-
-def _make_psm_output_table(
-    novel_psms: pd.DataFrame,
-    *,
-    peptide_to_proteins: Optional[Dict[str, List[str]]] = None,
-    missing_novel_ids: Optional[set[str]] = None,
-) -> pd.DataFrame:
-    columns = ["PSMId", "score", "q-value", "posterior_error_prob", "peptide", "proteinIds"]
-    if novel_psms.empty:
-        return pd.DataFrame(columns=columns)
-
-    output = pd.DataFrame(
-        {
-            "PSMId": novel_psms["SpecId"].astype(str),
-            "score": pd.to_numeric(novel_psms["estimated_psm_matched_score"], errors="coerce"),
-            "q-value": pd.to_numeric(novel_psms["estimated_psm_q_value"], errors="coerce"),
-            "posterior_error_prob": pd.to_numeric(novel_psms["estimated_psm_pep"], errors="coerce"),
-            "peptide": novel_psms["modified_peptide"].astype(str),
-            "proteinIds": novel_psms["Proteins"].astype(str).map(
-                lambda text: _protein_ids_csv_from_text(
-                    text,
-                    peptide_to_proteins=peptide_to_proteins,
-                    missing_novel_ids=missing_novel_ids,
-                )
-            ),
-        }
-    )
-    output = output.sort_values(by=["score", "PSMId"], ascending=[False, True], na_position="last")
-    return output.loc[:, columns].reset_index(drop=True)
-
-
-def _compute_peptide_estimates(novel_psms: pd.DataFrame, lookup_cache: Dict[str, object]) -> pd.DataFrame:
-    if novel_psms.empty:
-        novel_psms["estimated_peptide_q_value"] = np.nan
-        novel_psms["estimated_peptide_pep"] = np.nan
-        novel_psms["estimated_peptide_matched_score"] = np.nan
-        novel_psms["estimated_peptide_fallback"] = False
-        return novel_psms
-
-    novel_psms = novel_psms.copy()
-    novel_psms["estimated_peptide_q_value"] = np.nan
-    novel_psms["estimated_peptide_pep"] = np.nan
-    novel_psms["estimated_peptide_matched_score"] = np.nan
-    novel_psms["estimated_peptide_fallback"] = False
-
-    grouped = novel_psms.groupby(["percolator_peptides_file", "input_file_key"], dropna=False).groups
-    for (ref_path, input_file_key), index_values in grouped.items():
-        partitioned_lookup = _lookup_cache_get(lookup_cache, ref_path, build_partitioned_reference_lookup)
-        lookup = partitioned_lookup.lookup_for_input_key(str(input_file_key))
-        index_list = list(index_values)
-        scores = novel_psms.loc[index_list, "final_score"].to_numpy(dtype=np.float64, copy=False)
-        est_q, est_pep, matched, fallback = lookup.estimate_array(scores)
-        novel_psms.loc[index_list, "estimated_peptide_q_value"] = est_q
-        novel_psms.loc[index_list, "estimated_peptide_pep"] = est_pep
-        novel_psms.loc[index_list, "estimated_peptide_matched_score"] = matched
-        novel_psms.loc[index_list, "estimated_peptide_fallback"] = fallback
-    return novel_psms
-
-
-def _make_modified_summary(
-    novel_psms: pd.DataFrame,
-    *,
-    peptide_to_proteins: Optional[Dict[str, List[str]]] = None,
-    missing_novel_ids: Optional[set[str]] = None,
-) -> pd.DataFrame:
-    """Build reference-style peptide table with one highest-score row per peptide."""
-
-    columns = ["PSMId", "score", "q-value", "posterior_error_prob", "peptide", "proteinIds"]
-    if novel_psms.empty:
-        return pd.DataFrame(columns=columns)
-
-    table = pd.DataFrame(
-        {
-            "PSMId": novel_psms["SpecId"].astype(str),
-            "score": pd.to_numeric(novel_psms["estimated_peptide_matched_score"], errors="coerce"),
-            "q-value": pd.to_numeric(novel_psms["estimated_peptide_q_value"], errors="coerce"),
-            "posterior_error_prob": pd.to_numeric(novel_psms["estimated_peptide_pep"], errors="coerce"),
-            "peptide": novel_psms["modified_peptide"].astype(str),
-            "proteinIds": novel_psms["Proteins"].astype(str).map(
-                lambda text: _protein_ids_csv_from_text(
-                    text,
-                    peptide_to_proteins=peptide_to_proteins,
-                    missing_novel_ids=missing_novel_ids,
-                )
-            ),
-            "_final_score": pd.to_numeric(novel_psms["final_score"], errors="coerce"),
-        }
-    )
-
-    ranked = table.sort_values(
-        by=["peptide", "score", "_final_score", "PSMId"],
-        ascending=[True, False, False, True],
-        na_position="last",
-    )
-    best_per_peptide = ranked.groupby("peptide", as_index=False, sort=False).first()
-    output = best_per_peptide.sort_values(by=["score", "PSMId"], ascending=[False, True], na_position="last")
-    return output.loc[:, columns].reset_index(drop=True)
-
-
-def _make_unmodified_summary(novel_psms: pd.DataFrame) -> pd.DataFrame:
-    if novel_psms.empty:
-        return pd.DataFrame(
-            columns=[
-                "mass_file",
-                "unmodified_peptide",
-                "novel_psm_count",
-                "modified_form_count",
-                "best_final_score",
-                "estimated_psm_q_value",
-                "estimated_psm_pep",
-                "estimated_peptide_q_value",
-                "estimated_peptide_pep",
-            ]
-        )
-
-    ranked = novel_psms.sort_values(
-        ["mass_file", "unmodified_peptide", "final_score"],
-        ascending=[True, True, False],
-    )
-    best = ranked.groupby(["mass_file", "unmodified_peptide"], as_index=False).first()
-    counts = (
-        novel_psms.groupby(["mass_file", "unmodified_peptide"], as_index=False)
-        .size()
-        .rename(columns={"size": "novel_psm_count"})
-    )
-    form_counts = (
-        novel_psms.groupby(["mass_file", "unmodified_peptide"], as_index=False)["modified_peptide"]
-        .nunique()
-        .rename(columns={"modified_peptide": "modified_form_count"})
-    )
-    summary = best.merge(counts, on=["mass_file", "unmodified_peptide"], how="left")
-    summary = summary.merge(form_counts, on=["mass_file", "unmodified_peptide"], how="left")
-    summary = summary.rename(columns={"final_score": "best_final_score"})
-    keep_cols = [
-        "mass_file",
-        "unmodified_peptide",
-        "novel_psm_count",
-        "modified_form_count",
-        "best_final_score",
-        "estimated_psm_q_value",
-        "estimated_psm_pep",
-        "estimated_peptide_q_value",
-        "estimated_peptide_pep",
-    ]
-    return summary.loc[:, keep_cols]
-
-
-def _make_protein_summary(novel_psms: pd.DataFrame) -> pd.DataFrame:
-    if novel_psms.empty:
-        return pd.DataFrame(
-            columns=[
-                "mass_file",
-                "novel_protein_id",
-                "novel_psm_count",
-                "modified_peptide_count",
-                "unmodified_peptide_count",
-                "best_final_score",
-                "estimated_psm_q_value",
-                "estimated_psm_pep",
-            ]
-        )
-
-    exploded = (
-        novel_psms.assign(novel_protein_id=novel_psms["novel_protein_ids"])
-        .explode("novel_protein_id")
-        .dropna(subset=["novel_protein_id"])
-    )
-    ranked = exploded.sort_values(
-        ["mass_file", "novel_protein_id", "final_score"],
-        ascending=[True, True, False],
-    )
-    best = ranked.groupby(["mass_file", "novel_protein_id"], as_index=False).first()
-    counts = (
-        exploded.groupby(["mass_file", "novel_protein_id"], as_index=False)
-        .size()
-        .rename(columns={"size": "novel_psm_count"})
-    )
-    mod_count = (
-        exploded.groupby(["mass_file", "novel_protein_id"], as_index=False)["modified_peptide"]
-        .nunique()
-        .rename(columns={"modified_peptide": "modified_peptide_count"})
-    )
-    unmod_count = (
-        exploded.groupby(["mass_file", "novel_protein_id"], as_index=False)["unmodified_peptide"]
-        .nunique()
-        .rename(columns={"unmodified_peptide": "unmodified_peptide_count"})
-    )
-    summary = best.merge(counts, on=["mass_file", "novel_protein_id"], how="left")
-    summary = summary.merge(mod_count, on=["mass_file", "novel_protein_id"], how="left")
-    summary = summary.merge(unmod_count, on=["mass_file", "novel_protein_id"], how="left")
-    summary = summary.rename(columns={"final_score": "best_final_score"})
-    keep_cols = [
-        "mass_file",
-        "novel_protein_id",
-        "novel_psm_count",
-        "modified_peptide_count",
-        "unmodified_peptide_count",
-        "best_final_score",
-        "estimated_psm_q_value",
-        "estimated_psm_pep",
-    ]
-    return summary.loc[:, keep_cols]
-
-
-def _score_winner_rows_from_pin(
-    run,
-    pin_path: Path,
-    model_cache: Dict[str, object],
-    psm_lookup_cache: Dict[str, object],
-    warnings: List[str],
-) -> pd.DataFrame:
-    if run.init_weights is None or run.percolator_psms is None or run.percolator_peptides is None:
-        raise RuntimeError(
-            f"Run {run.run_index}: scoring references are missing "
-            "(init-weights/percolator-psms/percolator-peptides)."
-        )
-
-    pin_df = read_pin(pin_path)
-    return _score_winner_rows_from_df(
-        run=run,
-        pin_df=pin_df,
-        model_cache=model_cache,
-        psm_lookup_cache=psm_lookup_cache,
-        warnings=warnings,
-    )
-
-
-def _score_winner_rows_from_df(
-    run,
-    pin_df: pd.DataFrame,
-    model_cache: Dict[str, object],
-    psm_lookup_cache: Dict[str, object],
-    warnings: List[str],
-) -> pd.DataFrame:
-    if run.init_weights is None or run.percolator_psms is None or run.percolator_peptides is None:
-        raise RuntimeError(
-            f"Run {run.run_index}: scoring references are missing "
-            "(init-weights/percolator-psms/percolator-peptides)."
-        )
-
-    models = _lookup_cache_get(model_cache, run.init_weights, parse_selected_models)
-    validate_models_feature_alignment(models)
-    scored = score_pin_candidates(pin_df, models)
-    winners = select_best_psm_per_spectrum(scored, run.mass_file)
-
-    partitioned_lookup = _lookup_cache_get(
-        psm_lookup_cache, run.percolator_psms, build_partitioned_reference_lookup
-    )
-    est_q = np.full(len(winners), np.nan, dtype=np.float64)
-    est_pep = np.full(len(winners), np.nan, dtype=np.float64)
-    matched = np.full(len(winners), np.nan, dtype=np.float64)
-    fallback = np.zeros(len(winners), dtype=bool)
-
-    for input_file_key, index_values in winners.groupby("input_file_key", dropna=False).groups.items():
-        index_list = list(index_values)
-        lookup = partitioned_lookup.lookup_for_input_key(str(input_file_key))
-        psm_scores = winners.loc[index_list, "final_score"].to_numpy(dtype=np.float64, copy=False)
-        g_q, g_pep, g_matched, g_fallback = lookup.estimate_array(psm_scores)
-        est_q[index_list] = g_q
-        est_pep[index_list] = g_pep
-        matched[index_list] = g_matched
-        fallback[index_list] = g_fallback
-
-    fallback_count = int(np.count_nonzero(fallback))
-    if fallback_count > 0:
-        warnings.append(
-            f"Run {run.run_index}: {fallback_count} winner PSM(s) had no smaller score in "
-            f"reference {run.percolator_psms}; assigned q-value=1 and PEP=1."
-        )
-
-    winners["estimated_psm_q_value"] = est_q
-    winners["estimated_psm_pep"] = est_pep
-    winners["estimated_psm_matched_score"] = matched
-    winners["estimated_psm_fallback"] = fallback
-    winners["run_index"] = run.run_index
-    winners["row_index"] = run.row_index
-    winners["params_file"] = run.params
-    winners["database_file"] = run.database
-    winners["init_weights_file"] = run.init_weights
-    winners["percolator_psms_file"] = run.percolator_psms
-    winners["percolator_peptides_file"] = run.percolator_peptides
-    winners["protein_ids"] = winners["Proteins"].astype(str).map(_protein_ids_csv_from_text)
-    return winners
-
-
-def _score_winner_rows_for_tsv_groups(
-    run,
-    pin_path: Path,
-    config,
-    model_cache: Dict[str, object],
-    psm_lookup_cache: Dict[str, object],
-    warnings: List[str],
-) -> List[pd.DataFrame]:
-    pin_df = read_pin(pin_path).copy()
-    pin_df["__input_file_key"] = pin_df["SpecId"].astype(str).map(extract_input_file_key)
-    winners_parts: List[pd.DataFrame] = []
-
-    for group in config.scoring_groups:
-        subset = pin_df[pin_df["__input_file_key"].isin(set(group.mass_file_keys))].drop(
-            columns=["__input_file_key"]
-        )
-        if subset.empty:
-            warnings.append(
-                f"Run {run.run_index}.{group.group_index}: no PIN rows matched "
-                f"input-file keys for init-weights {group.init_weights}."
-            )
-            continue
-
-        run_proxy = SimpleNamespace(
-            run_index=f"{run.run_index}.{group.group_index}",
-            row_index=run.row_index,
-            mass_file=",".join(group.mass_files),
-            params=run.params,
-            database=run.database,
-            init_weights=group.init_weights,
-            percolator_psms=group.percolator_psms,
-            percolator_peptides=group.percolator_peptides,
-        )
-        winners_parts.append(
-            _score_winner_rows_from_df(
-                run=run_proxy,
-                pin_df=subset,
-                model_cache=model_cache,
-                psm_lookup_cache=psm_lookup_cache,
-                warnings=warnings,
-            )
-        )
-
-    return winners_parts
-
-
-def _resolve_internal_novel_mapping_path(config, output_dir: Path, output_prefix: str) -> Path:
-    if config.internal_novel_peptide:
-        candidate = Path(str(config.internal_novel_peptide)).expanduser()
-        if not candidate.is_absolute():
-            candidate = (Path.cwd() / candidate).resolve()
-        else:
-            candidate = candidate.resolve()
-        return candidate
-    return (output_dir / f"{output_prefix}.internal_novel_peptide.tsv").resolve()
 
 
 def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
