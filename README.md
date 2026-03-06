@@ -20,6 +20,9 @@ Supported run modes:
 ## Installation
 
 ```bash
+cd $FOLDER
+git clone https://github.com/ATPs/ProtCosmo.git
+cd ProtCosmo
 python -m pip install -e .
 ```
 
