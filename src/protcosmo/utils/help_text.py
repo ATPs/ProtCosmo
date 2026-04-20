@@ -44,6 +44,7 @@ Quick format notes:
 - --stop-after-cometplus: run CometPlus then stop (no scoring/reporting).
 - --novel_protein: FASTA input.
 - --novel_peptide: FASTA or tokenized text (comma/space/tab/newline delimiters).
+- --known_peptide: reuse a previously exported CometPlus known-peptide cache.
 - --output_internal_novel_peptide: auto-enabled in novel mode as `--output-dir/<output-prefix>.internal_novel_peptide.tsv`.
 - --internal_novel_peptide: reuse previously exported internal novel TSV.
 - --stop-after-saving-novel-peptide: stop after TSV export, skip search/scoring in ProtCosmo.
@@ -95,7 +96,7 @@ Step 2. Run CometPlus for each mass file
   --output_percolatorfile 1, --max_duplicate_proteins -1
 - One run may include one or many spectrum input files.
 - Optional ProtCosmo-controlled options forwarded to CometPlus:
-  --novel_protein, --novel_peptide, --output_internal_novel_peptide,
+  --novel_protein, --novel_peptide, --known_peptide, --output_internal_novel_peptide,
   --internal_novel_peptide, --stop-after-saving-novel-peptide,
   --keep-tmp, --run-comet-each, --thread, scan filters (single-run only)
 - Unknown options are passed through to CometPlus unchanged.
@@ -170,6 +171,12 @@ Option details and format examples:
   K.PEPTIDE.R
 - Parsed examples become:
   PEPTIDEK, PEPTIDEL, ACDEFG, KPEPTIDER
+
+--known_peptide <file>
+- Forwarded directly to CometPlus.
+- Reuse a previously exported known-peptide cache file.
+- ProtCosmo does not generate or refresh this cache automatically.
+- `--output_known_peptide` is not modeled as a first-class ProtCosmo option.
 
 --output_internal_novel_peptide <file>
 - Forwarded directly to CometPlus.

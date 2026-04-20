@@ -72,6 +72,7 @@ Notes:
 - `--input_tsv` and `--mass-file` cannot be used together.
 - `--input-pin` takes precedence when both `--input-pin` and `--input_tsv` are provided.
 - CLI `--init-weights`, `--percolator-psms`, `--percolator-peptides` each accept only one value.
+- `--known_peptide` is a global optional CometPlus cache-reuse input; ProtCosmo does not model `--output_known_peptide`.
 
 ## Input formats
 
@@ -181,7 +182,25 @@ protcosmo \
   --output-prefix multi_run
 ```
 
-### Example 3: `--input_tsv` mode with multiple init-weight groups
+### Example 3: Reuse a CometPlus known-peptide cache
+
+```bash
+protcosmo \
+  --mass-file /data/spec/run01.mzMLb \
+  --params /data/config/comet.params \
+  --database /data/db/known.idx \
+  --known_peptide /data/out/known.txt \
+  --novel_peptide /data/novel/novel_peptide.txt \
+  --init-weights /data/models/selected.weights \
+  --percolator-psms /data/ref/target.psms.tsv \
+  --percolator-peptides /data/ref/target.peptides.tsv \
+  --output-dir /data/out/protcosmo \
+  --output-prefix run01_reuse
+```
+
+Use this when CometPlus already exported a compatible known-peptide cache and you want ProtCosmo to pass it back through via `--known_peptide`.
+
+### Example 4: `--input_tsv` mode with multiple init-weight groups
 
 ```bash
 protcosmo \
@@ -199,7 +218,7 @@ Behavior in this mode:
 2. If TSV has multiple effective `init-weights`, ProtCosmo splits PIN rows by input key and scores each group independently.
 3. Group scoring runs in parallel when `--thread > 1`.
 
-### Example 4: `--input-pin` mode (skip CometPlus)
+### Example 5: `--input-pin` mode (skip CometPlus)
 
 ```bash
 protcosmo \
@@ -213,7 +232,7 @@ protcosmo \
 
 Use this when PIN has already been generated and only scoring/reporting is needed.
 
-### Example 5: Stop after CometPlus
+### Example 6: Stop after CometPlus
 
 ```bash
 protcosmo \
@@ -227,7 +246,7 @@ protcosmo \
 
 This runs CometPlus and exits before scoring/report generation.
 
-### Example 6: Force overwrite existing novel PIN
+### Example 7: Force overwrite existing novel PIN
 
 ```bash
 protcosmo \

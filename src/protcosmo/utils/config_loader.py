@@ -70,6 +70,7 @@ class PipelineConfig:
     scoring_groups: List[ScoringGroupConfig]
     novel_protein: Optional[str]
     novel_peptide: Optional[str]
+    known_peptide: Optional[str]
     output_internal_novel_peptide: Optional[str]
     internal_novel_peptide: Optional[str]
     stop_after_saving_novel_peptide: bool
@@ -416,6 +417,7 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
             scoring_groups=[],
             novel_protein=args.novel_protein,
             novel_peptide=args.novel_peptide,
+            known_peptide=getattr(args, "known_peptide", None),
             output_internal_novel_peptide=getattr(args, "output_internal_novel_peptide", None),
             internal_novel_peptide=getattr(args, "internal_novel_peptide", None),
             stop_after_saving_novel_peptide=False,
@@ -485,6 +487,7 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
             scoring_groups=scoring_groups,
             novel_protein=args.novel_protein,
             novel_peptide=args.novel_peptide,
+            known_peptide=getattr(args, "known_peptide", None),
             output_internal_novel_peptide=getattr(args, "output_internal_novel_peptide", None),
             internal_novel_peptide=getattr(args, "internal_novel_peptide", None),
             stop_after_saving_novel_peptide=stop_after,
@@ -577,6 +580,7 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
         scoring_groups=[],
         novel_protein=args.novel_protein,
         novel_peptide=args.novel_peptide,
+        known_peptide=getattr(args, "known_peptide", None),
         output_internal_novel_peptide=getattr(args, "output_internal_novel_peptide", None),
         internal_novel_peptide=getattr(args, "internal_novel_peptide", None),
         stop_after_saving_novel_peptide=stop_after,

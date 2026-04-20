@@ -180,6 +180,8 @@ def build_comet_command(
         command.extend(["--novel_protein", _resolve_arg_path(config.novel_protein)])
     if config.novel_peptide:
         command.extend(["--novel_peptide", _resolve_arg_path(config.novel_peptide)])
+    if config.known_peptide:
+        command.extend(["--known_peptide", _resolve_arg_path(config.known_peptide)])
     output_internal_novel = config.output_internal_novel_peptide
     if output_internal_novel is None and (config.novel_protein or config.novel_peptide):
         output_internal_novel = str((config.output_dir / f"{config.output_prefix}.internal_novel_peptide.tsv").resolve())

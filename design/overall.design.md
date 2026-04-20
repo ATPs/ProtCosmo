@@ -118,7 +118,7 @@ For each run:
 1. Build command with fixed options:
    - `--params`, `--database`, `--output-folder`, `--output_percolatorfile 1`, `--max_duplicate_proteins -1`.
 2. Append optional ProtCosmo-managed options:
-   - novel options, scan filters (when enabled), stop/keep/thread/run-comet-each.
+   - novel options, `--known_peptide`, scan filters (when enabled), stop/keep/thread/run-comet-each.
 3. In novel mode, if `--output_internal_novel_peptide` is missing, auto-set default output path.
 4. Append passthrough args and mass-file inputs.
 5. PIN reuse/overwrite rule (PIN-required runs only):
@@ -205,6 +205,89 @@ ProtCosmo no longer writes these files:
 3. `<output-prefix>.run_metadata.json`
 4. `<output-prefix>.warnings.log`
 
+## 2.1 Local profiling workflow
+
+`local_test/profile_peptide_runtime.py` is a local-test helper for timing analysis of one novel-peptide run on real PXD010154 data.
+
+It is not part of the production CLI path; instead it reproduces the standard single-run flow with explicit timers:
+
+1. Resolve one `idn` to:
+   - mass file under `ms2mzMLb/`
+   - group-specific weights / percolator references from `PXD010154.info.tsv`
+2. Build the same ProtCosmo CLI argument set used by `python -m protcosmo.protcosmo`.
+3. Call `load_pipeline_config(...)` to reuse normal path validation and argument normalization.
+4. Call `run_cometplus_search(...)` directly and save raw CometPlus stdout/stderr text.
+5. Parse CometPlus stderr/stdout timing lines such as:
+   - `known peptide extraction done`
+   - `novel candidate assembly done`
+   - `novel candidate subtraction done`
+   - `novel mass calculation done`
+   - `internal novel peptide export done`
+   - `scan prefilter ...`
+   - stdout search lines like `- searching "<path>" ... 39 sec (...)`
+   - any other `[...] <label> done (<sec>; total <sec>)` lines
+6. Continue ProtCosmo scoring/report steps explicitly and time each major stage:
+   - PIN read
+   - weights parse
+   - candidate scoring
+   - winner selection
+   - PSM reference lookup build
+   - PSM q/PEP estimation
+   - novel subset build
+   - peptide reference lookup build
+   - peptide q/PEP estimation
+   - internal novel mapping load
+   - report table construction
+   - report TSV writes
+7. Write timing outputs to the profiling output directory:
+   - `timing.steps.tsv`
+   - `timing.summary.json`
+   - raw CometPlus stdout/stderr dumps
+8. Profiling results can be summarized in `notes/` with:
+   - the exact outer profiling command
+   - the exact generated ProtCosmo command
+   - measured stage timings
+   - full-dataset extrapolation and comparison with prior large-scale runs
+
+## 2.2 Real multi-input full-scale profiling workflow
+
+For PRIDE-style cached datasets such as `PXD010154`, the real full-scale peptide workflow should follow the same shape as `protcosmo_PRIDE.py`:
+
+1. Reuse the prepared `ms2duck/protcosmo.input.tsv`.
+2. Run one repo-local ProtCosmo command with:
+   - `python -m protcosmo.protcosmo`
+   - `--input_tsv <.../protcosmo.input.tsv>`
+   - `--novel_peptide <...>`
+   - `--thread <N>`
+   - `--log`
+3. Do not wrap the run in GNU Parallel for the main execution step.
+4. Let CometPlus handle its own internal parallelism:
+   - `mzMLb` process-parallel scan prefilter workers
+   - grouped `run-comet-each` shard searches
+
+Important runtime behavior for this mode:
+
+1. `run_cometplus_search(...)` uses `subprocess.run(..., capture_output=True)`.
+2. Because of that, `<output-prefix>.log` stays empty while the CometPlus subprocess is still running.
+3. After CometPlus exits, ProtCosmo prints and mirrors the captured stdout/stderr into `<output-prefix>.log`.
+4. This means real-time progress is visible from process state and generated intermediate files, while the final timing breakdown becomes available only after the CometPlus subprocess returns.
+
+Recommended places to read timing information after a full-scale run:
+
+1. `/usr/bin/time` output file:
+   - total wall time
+   - user/sys CPU time
+   - RSS
+2. `<output-prefix>.log`:
+   - cumulative CometPlus wall times from `... done (<sec>; total <sec>)`
+   - per-input prefilter timings from `scan prefilter: ...`
+   - grouped merge/search behavior from `run-comet-each grouped merge`, `- searching ...`, and `run-comet-each done`
+3. Final output files:
+   - `<output-prefix>.internal_novel_peptide.tsv`
+   - `<output-prefix>.cometplus.novel.pin`
+   - `<output-prefix>.nove.psms.tsv`
+   - `<output-prefix>.novel.peptides.tsv`
+
 ## 3. Important Behavior Notes
 
 1. Unknown CLI options are passed through to CometPlus only in CometPlus path.
@@ -215,3 +298,5 @@ ProtCosmo no longer writes these files:
 6. Caches are reused across runs/groups to avoid duplicate model/reference loads.
 7. CLI scoring refs are single-value options; per-mass-file scoring variation uses `--input_tsv`.
 8. `--thread` controls both CometPlus `num_threads` forwarding and parallel worker count for multi-group TSV scoring.
+9. `--known_peptide` is a first-class global ProtCosmo CLI option that resolves to an absolute path before CometPlus execution.
+10. `--output_known_peptide` is not modeled by ProtCosmo; users may still rely on raw passthrough for unmanaged CometPlus options.

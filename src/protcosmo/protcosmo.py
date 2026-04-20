@@ -236,6 +236,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     novel_group.add_argument(
+        "--known_peptide",
+        help=(
+            "reuse previously exported CometPlus known-peptide cache.\n"
+            "Forwarded to CometPlus as --known_peptide."
+        ),
+    )
+    novel_group.add_argument(
         "--output_internal_novel_peptide",
         dest="output_internal_novel_peptide",
         help=(
