@@ -10,6 +10,7 @@ It is designed for workflows that need novel peptide/protein discovery while kee
 3. Selects one winner PSM per spectrum.
 4. Estimates q-value and PEP by lookup from reference PSM/peptide tables.
 5. Writes novel-focused report TSV files.
+6. Optionally uses a two-pass DuckDB + `mgf.parquet` fast path for novel runs when `--ms2-parquet` and `--mgf-parquet-dir` are both provided.
 
 Supported run modes:
 
@@ -41,6 +42,7 @@ protcosmo --version
   - `numpy>=1.23`
   - `pandas>=1.5`
   - `pyarrow>=10.0`
+  - `duckdb>=1.0` for the optional parquet fast path
 
 ## Core arguments
 
@@ -73,6 +75,10 @@ Notes:
 - `--input-pin` takes precedence when both `--input-pin` and `--input_tsv` are provided.
 - CLI `--init-weights`, `--percolator-psms`, `--percolator-peptides` each accept only one value.
 - `--known_peptide` is a global optional CometPlus cache-reuse input; ProtCosmo does not model `--output_known_peptide`.
+- `--ms2-parquet` and `--mgf-parquet-dir` must be provided together to enable the parquet fast path.
+- In the parquet fast path, ProtCosmo forwards the user's `--thread` value unchanged when one is provided; if `--thread` is omitted, CometPlus uses its normal default thread behavior.
+- In the parquet fast path, `--known_peptide` is forwarded only in pass 1; pass 2 resumes with `--internal_novel_peptide`.
+- In the parquet fast path, `isotope_error` matching follows CometPlus novel prefilter semantics, including the signed offset sets for modes `0..7`; raw precursor mz is matched against internal windows shifted by the same effective isotope offset in mz-space.
 
 ## Input formats
 
@@ -128,6 +134,11 @@ Optional runtime log:
 Important:
 
 - q-value/PEP in output are lookup-based estimates from reference tables.
+- When the parquet fast path is used, ProtCosmo also writes:
+  - `<output-prefix>.fastpath.scan_matches.tsv`
+  - `<output-prefix>.fastpath.mgf_manifest.tsv`
+  - `<output-prefix>.fastpath.timing.json`
+  - staged subset MGFs under `<output-prefix>.fastpath_subset_mgfs/` unless `--keep-tmp` is not set, in which case they are removed after the run.
 
 ## Detailed examples
 
@@ -218,7 +229,63 @@ Behavior in this mode:
 2. If TSV has multiple effective `init-weights`, ProtCosmo splits PIN rows by input key and scores each group independently.
 3. Group scoring runs in parallel when `--thread > 1`.
 
-### Example 5: `--input-pin` mode (skip CometPlus)
+### Example 5: Two-pass parquet fast path for a PRIDE-style multi-input novel-peptide run
+
+```bash
+protcosmo \
+  --cometplus /data/p/comet/Comet/ProtCosmo/CometPlus/cometplus \
+  --input_tsv /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/ms2duck/protcosmo.input.tsv \
+  --novel_peptide /data/p/xiaolong/ProtCosmo/ProtCosmo/local_test/data/novel_peptides \
+  --known_peptide /data2/pub/proteome/web/protinsight/comet/proteins/20260206/cmt_2026_01_input_with_decoy_HCD__protinsight_proteinseq.target.decoy.fasta.idx.known_peptide.txt \
+  --ms2-parquet /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/ms2duck/PXD010154_ms2.parquet \
+  --mgf-parquet-dir /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/mzDuck \
+  --output-dir /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/protcosmo_fastpath \
+  --thread 20 \
+  --log
+```
+
+Behavior in this mode:
+
+1. Pass 1 runs CometPlus on the original inputs, exports the detailed internal novel TSV, forwards `--known_peptide` when present, and stops before search.
+2. ProtCosmo uses DuckDB against `--ms2-parquet` plus per-file `*.mgf.parquet` files to stage compact subset MGFs, with `isotope_error` handling matched to CometPlus novel prefiltering.
+3. Pass 2 resumes CometPlus with `--internal_novel_peptide` on the staged subset MGFs.
+4. Search/scoring/reporting after pass 2 are unchanged from the existing workflow.
+
+Fast-path advantages and recommended usage:
+
+1. Why this path is usually faster on large PRIDE-style runs:
+   - It avoids full-spectrum prefiltering on all original mzML/mzMLb files.
+   - It builds a narrow scan set from `ms2.parquet` + internal novel windows first, then searches only staged subset MGFs.
+   - It reuses `--known_peptide` in pass 1 to speed novel-candidate preparation when a known-peptide cache exists.
+2. When to use it:
+   - Multi-file novel-peptide/novel-protein runs, especially when total input size is large.
+   - Cases where `<project>_ms2.parquet` and per-file `*.mgf.parquet` are already available.
+3. When not to use it:
+   - If `--ms2-parquet` or `--mgf-parquet-dir` is unavailable.
+   - If you are in `--input-pin` mode (CometPlus is skipped, so fast path is irrelevant).
+4. Operational notes:
+   - Provide both `--ms2-parquet` and `--mgf-parquet-dir` together, otherwise fast path is disabled.
+   - Keep `--thread` explicit for reproducible benchmark comparisons.
+   - In pass 2, ProtCosmo resumes with `--internal_novel_peptide` and does not forward `--known_peptide`.
+5. Benchmark-only rerun pattern (reuse baseline outputs, rerun only fast path):
+
+```bash
+cd /data/p/xiaolong/ProtCosmo/ProtCosmo
+export PATH=/data/p/bin:/data/p/anaconda3/bin:$PATH
+export PYTHONPATH=src
+/data/p/anaconda3/bin/python local_test/benchmark_pxd010154_parquet_fastpath.py \
+  --thread 20 \
+  --baseline-output-dir /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/protcosmo_20260421_novel_peptides_input_tsv_known_t20 \
+  --baseline-keep-tmp-output-dir /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/protcosmo_20260422_novel_peptides_input_tsv_known_t20_keep_tmp_cometonly \
+  --fastpath-output-dir /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/protcosmo_20260422_novel_peptides_parquet_fastpath_isofix_known_t20 \
+  --note-path /data/p/xiaolong/ProtCosmo/ProtCosmo/notes/20260421.pxd010154_parquet_fastpath.runtime.md \
+  --execute-fastpath-only \
+  --force
+```
+
+This mode keeps existing baseline outputs unchanged and updates only the fast-path run plus the runtime comparison note.
+
+### Example 6: `--input-pin` mode (skip CometPlus)
 
 ```bash
 protcosmo \
@@ -232,7 +299,7 @@ protcosmo \
 
 Use this when PIN has already been generated and only scoring/reporting is needed.
 
-### Example 6: Stop after CometPlus
+### Example 7: Stop after CometPlus
 
 ```bash
 protcosmo \
@@ -246,7 +313,7 @@ protcosmo \
 
 This runs CometPlus and exits before scoring/report generation.
 
-### Example 7: Force overwrite existing novel PIN
+### Example 8: Force overwrite existing novel PIN
 
 ```bash
 protcosmo \

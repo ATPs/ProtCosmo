@@ -45,6 +45,8 @@ Quick format notes:
 - --novel_protein: FASTA input.
 - --novel_peptide: FASTA or tokenized text (comma/space/tab/newline delimiters).
 - --known_peptide: reuse a previously exported CometPlus known-peptide cache.
+- --ms2-parquet and --mgf-parquet-dir: optional paired inputs that enable the two-pass DuckDB + mgf.parquet novel fast path.
+- Fast-path thread rule: ProtCosmo forwards the user's --thread value unchanged when one is provided; otherwise it leaves CometPlus thread handling unchanged.
 - --output_internal_novel_peptide: auto-enabled in novel mode as `--output-dir/<output-prefix>.internal_novel_peptide.tsv`.
 - --internal_novel_peptide: reuse previously exported internal novel TSV.
 - --stop-after-saving-novel-peptide: stop after TSV export, skip search/scoring in ProtCosmo.
@@ -95,6 +97,13 @@ Step 2. Run CometPlus for each mass file
   --params, --database, --output-folder <output-dir>,
   --output_percolatorfile 1, --max_duplicate_proteins -1
 - One run may include one or many spectrum input files.
+- Optional parquet fast path:
+  - only activates when both `--ms2-parquet` and `--mgf-parquet-dir` are provided;
+  - only applies to novel-mode CometPlus runs;
+  - pass 1 runs CometPlus on the original inputs, exports the detailed internal novel TSV, forwards `--known_peptide` when present, and stops before search;
+  - ProtCosmo then uses DuckDB to match scans from `--ms2-parquet`, extracts staged subset MGFs from `<basename>.mgf.parquet` files under `--mgf-parquet-dir`, and runs CometPlus pass 2 with `--internal_novel_peptide`;
+  - pass 2 does not forward `--novel_peptide`, `--novel_protein`, or `--known_peptide`;
+  - when `--thread` is provided, ProtCosmo forwards that exact value to both fast-path CometPlus passes.
 - Optional ProtCosmo-controlled options forwarded to CometPlus:
   --novel_protein, --novel_peptide, --known_peptide, --output_internal_novel_peptide,
   --internal_novel_peptide, --stop-after-saving-novel-peptide,
@@ -177,6 +186,17 @@ Option details and format examples:
 - Reuse a previously exported known-peptide cache file.
 - ProtCosmo does not generate or refresh this cache automatically.
 - `--output_known_peptide` is not modeled as a first-class ProtCosmo option.
+- When the parquet fast path is enabled, ProtCosmo forwards `--known_peptide` only in pass 1.
+
+--ms2-parquet <file>
+- Optional global ms2.parquet input for the novel fast path.
+- Must be provided together with `--mgf-parquet-dir`.
+- When both parquet inputs are absent, ProtCosmo stays on the current mzML/mzMLb workflow.
+
+--mgf-parquet-dir <dir>
+- Optional directory containing `<basename>.mgf.parquet` files for the novel fast path.
+- Must be provided together with `--ms2-parquet`.
+- ProtCosmo stages subset `<basename>.mgf` files under the output directory, preserves the original basenames, and removes them afterward unless `--keep-tmp` is set.
 
 --output_internal_novel_peptide <file>
 - Forwarded directly to CometPlus.

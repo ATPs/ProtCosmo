@@ -7,6 +7,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import sys
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, List, Sequence
 
 import pandas as pd
@@ -40,6 +41,13 @@ if __package__ in (None, ""):
         collapse_to_unmodified,
         normalize_modified_peptide,
     )
+    from protcosmo.utils.parquet_fastpath import (  # type: ignore
+        build_fastpath_subset_mgfs,
+        cleanup_fastpath_staged_dir,
+        prepare_fastpath_export_invocation,
+        prepare_fastpath_resume_invocation,
+        resolve_internal_novel_export_path,
+    )
     from protcosmo.utils.runtime_logging import PipelineLogger  # type: ignore
     from protcosmo.utils.report_writer import (  # type: ignore
         ensure_dir,
@@ -69,6 +77,13 @@ else:
         resolve_internal_novel_mapping_path as _resolve_internal_novel_mapping_path,
     )
     from .utils.peptide_utils import collapse_to_unmodified, normalize_modified_peptide
+    from .utils.parquet_fastpath import (
+        build_fastpath_subset_mgfs,
+        cleanup_fastpath_staged_dir,
+        prepare_fastpath_export_invocation,
+        prepare_fastpath_resume_invocation,
+        resolve_internal_novel_export_path,
+    )
     from .utils.runtime_logging import PipelineLogger
     from .utils.report_writer import ensure_dir, write_tsv
     from .utils import scoring_batches as _scoring_batches
@@ -243,6 +258,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     novel_group.add_argument(
+        "--ms2-parquet",
+        dest="ms2_parquet",
+        help=(
+            "optional global ms2.parquet input for the two-pass novel fast path.\n"
+            "Must be used together with --mgf-parquet-dir."
+        ),
+    )
+    novel_group.add_argument(
+        "--mgf-parquet-dir",
+        dest="mgf_parquet_dir",
+        help=(
+            "optional directory containing <basename>.mgf.parquet files for the two-pass novel fast path.\n"
+            "Must be used together with --ms2-parquet."
+        ),
+    )
+    novel_group.add_argument(
         "--output_internal_novel_peptide",
         dest="output_internal_novel_peptide",
         help=(
@@ -341,6 +372,7 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
     log_path = (output_dir / f"{output_prefix}.log").resolve() if config.log else None
     logger = PipelineLogger(log_path)
     output_paths: Dict[str, str] = {}
+    fastpath_artifacts = None
     if log_path is not None:
         output_paths["log"] = str(log_path)
 
@@ -350,7 +382,25 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
         psm_lookup_cache: Dict[str, object] = {}
         peptide_lookup_cache: Dict[str, object] = {}
         all_winners_parts: List[pd.DataFrame] = []
-        stop_after_any = config.stop_after_saving_novel_peptide or config.stop_after_cometplus
+        stop_after_export_only = config.stop_after_saving_novel_peptide
+        stop_after_search = config.stop_after_cometplus
+        stop_after_any = stop_after_export_only or stop_after_search
+
+        def _emit_cometplus_result(run, result, *, overwritten_target: Path | None = None) -> None:
+            if result.skipped:
+                logger.info(
+                    f"Run {run.run_index}: existing PIN found at {result.pin_path}; "
+                    "skipping CometPlus. Use --force to rerun and overwrite."
+                )
+                return
+            if result.overwrote_existing_pin and overwritten_target is not None:
+                logger.info(
+                    f"Run {run.run_index}: --force is set; overwriting existing PIN at {overwritten_target}."
+                )
+            if result.stdout_text:
+                logger.info(result.stdout_text)
+            if result.stderr_text:
+                logger.stderr(result.stderr_text)
 
         if config.input_pin:
             for run in config.runs:
@@ -364,37 +414,134 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
                 all_winners_parts.append(winners)
         else:
             novel_pin_path = (output_dir / f"{output_prefix}.cometplus.novel.pin").resolve()
-            for run in config.runs:
-                result = run_cometplus_search(
-                    run,
-                    config,
-                    output_dir,
-                    require_pin_output=(not stop_after_any),
-                )
-                if result.skipped:
+            if config.fastpath_enabled:
+                if config.fastpath_thread is None:
                     logger.info(
-                        f"Run {run.run_index}: existing PIN found at {result.pin_path}; "
-                        "skipping CometPlus. Use --force to rerun and overwrite."
+                        "Fast path: enabled with DuckDB subset-MGF staging "
+                        "(using default CometPlus thread handling)."
                     )
                 else:
-                    if result.overwrote_existing_pin:
+                    logger.info(
+                        "Fast path: enabled with DuckDB subset-MGF staging "
+                        f"(using --thread {config.fastpath_thread})."
+                    )
+            else:
+                logger.info("Fast path: disabled.")
+            for run in config.runs:
+                if config.fastpath_enabled:
+                    result = None
+                    if not stop_after_export_only and novel_pin_path.exists() and not config.force:
                         logger.info(
-                            f"Run {run.run_index}: --force is set; overwriting existing PIN at {novel_pin_path}."
+                            f"Run {run.run_index}: existing PIN found at {novel_pin_path}; "
+                            "skipping both fast-path CometPlus passes. Use --force to rerun and overwrite."
                         )
-                    if result.stdout_text:
-                        logger.info(result.stdout_text)
-                    if result.stderr_text:
-                        logger.stderr(result.stderr_text)
+                        result_pin_path = novel_pin_path
+                    else:
+                        internal_novel_path = resolve_internal_novel_export_path(config, output_dir)
+                        if config.internal_novel_peptide:
+                            internal_novel_path = Path(config.internal_novel_peptide).expanduser().resolve()
+                            logger.info(
+                                f"Run {run.run_index}: reusing provided internal novel peptide TSV: "
+                                f"{internal_novel_path}"
+                            )
+                        elif internal_novel_path.exists() and not config.force:
+                            logger.info(
+                                f"Run {run.run_index}: reusing existing internal novel peptide TSV: "
+                                f"{internal_novel_path}"
+                            )
+                        else:
+                            export_run, export_config, internal_novel_path = prepare_fastpath_export_invocation(
+                                run,
+                                config,
+                                output_dir,
+                            )
+                            export_start = perf_counter()
+                            result = run_cometplus_search(
+                                export_run,
+                                export_config,
+                                output_dir,
+                                require_pin_output=False,
+                            )
+                            _emit_cometplus_result(run, result)
+                            export_seconds = perf_counter() - export_start
+                            logger.info(
+                                f"Run {run.run_index}: fast-path pass 1 exported internal novel peptide TSV "
+                                f"in {export_seconds:.3f} sec "
+                                f"(known_peptide={'on' if bool(export_config.known_peptide) else 'off'})."
+                            )
+                            if not internal_novel_path.exists():
+                                raise RuntimeError(
+                                    f"Run {run.run_index}: fast-path pass 1 did not create "
+                                    f"{internal_novel_path}."
+                                )
 
-                if stop_after_any:
-                    continue
-                if result.pin_path is None:
-                    raise RuntimeError(f"Run {run.run_index}: CometPlus PIN output path is missing.")
+                        if stop_after_export_only:
+                            logger.info(
+                                f"Run {run.run_index}: stop-after-saving-novel-peptide requested; "
+                                "skipping fast-path subset-MGF build and resumed search."
+                            )
+                            continue
+
+                        subset_start = perf_counter()
+                        fastpath_artifacts = build_fastpath_subset_mgfs(
+                            run,
+                            config,
+                            output_dir,
+                            internal_novel_path,
+                        )
+                        subset_seconds = perf_counter() - subset_start
+                        logger.info(
+                            f"Run {run.run_index}: fast-path subset MGF build done in {subset_seconds:.3f} sec; "
+                            f"matched_inputs={fastpath_artifacts.matched_input_count}, "
+                            f"matched_scans={fastpath_artifacts.matched_scan_count}, "
+                            f"staged_spectra={fastpath_artifacts.staged_spectrum_count}."
+                        )
+
+                        resume_run, resume_config = prepare_fastpath_resume_invocation(
+                            run,
+                            config,
+                            fastpath_artifacts.staged_mass_files,
+                            internal_novel_path,
+                        )
+                        search_start = perf_counter()
+                        result = run_cometplus_search(
+                            resume_run,
+                            resume_config,
+                            output_dir,
+                            require_pin_output=(not stop_after_search),
+                        )
+                        _emit_cometplus_result(run, result, overwritten_target=novel_pin_path)
+                        search_seconds = perf_counter() - search_start
+                        logger.info(
+                            f"Run {run.run_index}: fast-path pass 2 resumed search completed "
+                            f"in {search_seconds:.3f} sec."
+                        )
+                        result_pin_path = result.pin_path
+
+                    if stop_after_search:
+                        continue
+                    if result_pin_path is None:
+                        raise RuntimeError(f"Run {run.run_index}: CometPlus PIN output path is missing.")
+                else:
+                    result = run_cometplus_search(
+                        run,
+                        config,
+                        output_dir,
+                        require_pin_output=(not stop_after_any),
+                    )
+                    _emit_cometplus_result(run, result, overwritten_target=novel_pin_path)
+
+                    if stop_after_any:
+                        continue
+                    if result.pin_path is None:
+                        raise RuntimeError(f"Run {run.run_index}: CometPlus PIN output path is missing.")
+                    result_pin_path = result.pin_path
+
                 if config.use_input_tsv and len(config.scoring_groups) > 1:
                     all_winners_parts.extend(
                         _score_winner_rows_for_tsv_groups(
                             run=run,
-                            pin_path=result.pin_path,
+                            pin_path=result_pin_path,
                             config=config,
                             model_cache=model_cache,
                             psm_lookup_cache=psm_lookup_cache,
@@ -404,7 +551,7 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
                 else:
                     winners = _score_winner_rows_from_pin(
                         run=run,
-                        pin_path=result.pin_path,
+                        pin_path=result_pin_path,
                         model_cache=model_cache,
                         psm_lookup_cache=psm_lookup_cache,
                         warnings=warnings,
@@ -480,6 +627,8 @@ def run_pipeline(args, passthrough_args: List[str]) -> Dict[str, str]:
         write_tsv(modified_summary, Path(output_paths["novel_peptides_modified"]))
         return output_paths
     finally:
+        if fastpath_artifacts is not None and not config.keep_tmp:
+            cleanup_fastpath_staged_dir(fastpath_artifacts)
         logger.close()
 
 

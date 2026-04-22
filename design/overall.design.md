@@ -55,19 +55,25 @@ Early-stop modes stop before scoring outputs.
 3. Validate mode conflicts:
    - stop-after flags are mutually exclusive;
    - `--input-pin` cannot combine with stop-after flags.
-4. If `--input-pin` is set:
+4. Resolve optional parquet fast-path inputs:
+   - `--ms2-parquet` and `--mgf-parquet-dir` must be provided together;
+   - both paths must exist;
+   - parquet fast path is rejected with `--input-pin`;
+   - parquet fast path requires novel-mode inputs;
+   - when the user provides `--thread`, the parquet fast path forwards that exact value to both CometPlus passes; otherwise it leaves thread handling unchanged.
+5. If `--input-pin` is set:
    - resolve to absolute path;
    - require scoring references (`--init-weights`, `--percolator-psms`, `--percolator-peptides`), each single CLI value;
    - create one `RunConfig` using this PIN.
    - If `--input_tsv` is also provided, input-pin mode wins and TSV rows are ignored.
-5. Else if `--input_tsv` is set:
+6. Else if `--input_tsv` is set:
    - reject simultaneous `--mass-file`;
    - parse TSV with header required;
    - required column: `mass-file`;
    - optional columns: `params`, `database`, `init-weights`, `percolator-psms`, `percolator-peptides`;
    - header matching is case-insensitive and accepts dash/underscore aliases;
    - unknown columns are ignored.
-6. TSV mode row handling:
+7. TSV mode row handling:
    - each `mass-file` cell must be one file path (no comma/list-file/directory semantics);
    - resolve paths;
    - derive per-row mass key from basename without suffix;
@@ -75,20 +81,21 @@ Early-stop modes stop before scoring outputs.
    - apply CLI override for scoring refs (`--init-weights`, `--percolator-psms`, `--percolator-peptides`), each single CLI value;
    - resolve effective `params`/`database` and require one unique value each across rows;
    - scoring refs are required unless stop-after mode.
-7. TSV scoring groups:
+8. TSV scoring groups:
    - group rows by effective `init-weights`;
    - each unique init-weights must map to exactly one `percolator-psms` and one `percolator-peptides`;
    - emit one merged run containing all TSV mass files.
-8. Else (standard `--mass-file` mode):
+9. Else (standard `--mass-file` mode):
    - resolve mass files via resolver (single/comma/list-file/directory);
    - detect novel mode if any of `--novel_protein`, `--novel_peptide`, `--internal_novel_peptide` is set;
    - merge multi-file novel inputs into one run;
    - require single-value `--params`, `--database`;
    - require single-value scoring refs unless stop-after mode.
-9. Scan-filter gating:
-   - if final run count > 1 and scan args are present, disable scan filters and append warning.
 
-Output is `PipelineConfig` with normalized runs and runtime booleans (`force`, `log`, `use_input_tsv`) and optional TSV scoring group metadata.
+10. Scan-filter gating:
+    - if final run count > 1 and scan args are present, disable scan filters and append warning.
+
+Output is `PipelineConfig` with normalized runs and runtime booleans (`force`, `log`, `use_input_tsv`) plus fast-path metadata (`ms2_parquet`, `mgf_parquet_dir`, `fastpath_enabled`, `fastpath_thread`) and optional TSV scoring group metadata.
 
 ## Step 1.1: Shared input key extraction
 
@@ -132,6 +139,45 @@ For each run:
 
 `protcosmo.run_pipeline` prints CometPlus stdout/stderr to screen and also writes them into `<output-prefix>.log` when `--log` is enabled.
 
+## Step 3.1: Optional two-pass parquet fast path (`utils.parquet_fastpath`)
+
+When `fastpath_enabled` is true, `protcosmo.run_pipeline` uses a two-pass search path instead of the standard one-pass mzML/mzMLb flow.
+
+1. Reuse rule:
+   - if `<output-prefix>.cometplus.novel.pin` already exists and `--force` is not set, skip both fast-path passes and reuse the existing PIN;
+   - if `--force` is set, rerun pass 1, rebuild staged MGFs, and rerun pass 2.
+2. Pass 1: internal novel export
+   - run CometPlus on the original `mass_files`;
+   - forward `--novel_peptide` or `--novel_protein`;
+   - forward `--known_peptide` when present;
+   - always request `<output-dir>/<output-prefix>.internal_novel_peptide.tsv` unless an explicit path was provided;
+   - add `--stop-after-saving-novel-peptide`;
+   - if `--thread` was provided, forward that exact value.
+3. Internal TSV reuse:
+   - if `--internal_novel_peptide` is provided, ProtCosmo reuses it directly;
+   - else if the expected internal TSV already exists and `--force` is not set, ProtCosmo reuses that TSV and skips pass 1.
+4. DuckDB subset staging:
+   - read the detailed internal TSV and require `charge`, `mz_window_min`, and `mz_window_max`;
+   - read charge policy from the run's `.params` file: `override_charge`, `precursor_charge`, and `isotope_error`;
+   - build isotope-shifted mz windows from the same signed isotope-offset set that CometPlus uses for `isotope_error` (`0`, `+1`, `-1`, `+4`, etc., depending on the selected mode);
+   - for each non-zero isotope offset, append a copy of the window table with `mz_window_min` and `mz_window_max` shifted by `offset_mass / charge`; this mirrors CometPlus's behaviour of subtracting isotope shifts from the experimental mass window, so raw precursor mz values land in the same effective search windows;
+   - match scan windows against `--ms2-parquet` by `idn`, charge (per `override_charge` semantics), and precursor `mz` against the combined original + isotope-shifted windows;
+   - write one staged `<basename>.mgf` file per matched input under `<output-prefix>.fastpath_subset_mgfs/`;
+   - preserve the original numeric basenames so grouped scoring and `SpecId` partitioning stay unchanged;
+   - write:
+     - `<output-prefix>.fastpath.scan_matches.tsv`
+     - `<output-prefix>.fastpath.mgf_manifest.tsv`
+     - `<output-prefix>.fastpath.timing.json`
+5. Pass 2: resumed search
+   - run CometPlus on the staged subset MGFs;
+   - use `--internal_novel_peptide <exported-or-reused TSV>`;
+   - do not forward `--novel_peptide`, `--novel_protein`, or `--known_peptide`;
+   - preserve `--run-comet-each`;
+   - if `--thread` was provided, forward that exact value.
+6. Cleanup:
+   - staged subset MGFs are removed after the run unless `--keep-tmp` is set;
+   - manifest/timing files remain in the output directory.
+
 ## Step 4: Score input source
 
 1. Input-pin mode: score provided PIN directly.
@@ -158,8 +204,10 @@ Per scoring batch:
 If `stop_after_any` is true:
 
 1. Skip novel summary report generation.
-2. Print collected warnings to screen (and log file when enabled).
-3. Return outputs map (empty unless `--log` was set).
+2. In fast-path mode, `--stop-after-saving-novel-peptide` stops after pass 1 and does not build staged MGFs or run pass 2.
+3. In fast-path mode, `--stop-after-cometplus` still runs pass 2 and then stops before PIN scoring/report generation.
+4. Print collected warnings to screen (and log file when enabled).
+5. Return outputs map (empty unless `--log` was set).
 
 ## Step 7: Novel subset, peptide estimation, and protein-id remap
 
@@ -288,6 +336,84 @@ Recommended places to read timing information after a full-scale run:
    - `<output-prefix>.nove.psms.tsv`
    - `<output-prefix>.novel.peptides.tsv`
 
+## 2.3 PXD010154 parquet benchmark note generator
+
+`local_test/benchmark_pxd010154_parquet_fastpath.py` is a repo-local analysis helper for the April 21, 2026 PXD010154 comparison note.
+
+It is not part of the production CLI path. Its job is to either run or reread the completed baseline and fast-path output directories, optionally run a dedicated baseline `--keep-tmp --stop-after-cometplus` recovery pass, and then write `notes/20260421.pxd010154_parquet_fastpath.runtime.md` with a reproducible timing breakdown plus exact scan-set attribution.
+
+It also supports `--execute-fastpath-only`, which reruns only the fast-path case and reuses existing baseline outputs without overwriting the baseline directory's `/usr/bin/time` sidecar.
+
+When the benchmark is rerun into an existing output directory, ProtCosmo appends to `protcosmo.log`. The helper therefore parses the latest fast-path-enabled or fast-path-disabled run block instead of the first matching timing lines.
+
+The helper records:
+
+1. Outer `/usr/bin/time` metrics:
+   - wall time
+   - user/sys CPU time
+   - RSS
+2. Core CometPlus step timings parsed from `protcosmo.log`:
+   - known peptide import
+   - novel candidate assembly/subtraction
+   - novel mass calculation
+   - internal novel peptide export/import
+   - scan prefilter
+   - `run-comet-each`
+   - fast-path pass 1 / subset-build / pass 2 totals
+3. Fast-path staging metrics parsed from `protcosmo.fastpath.timing.json`:
+   - DuckDB scan-match time
+   - MGF materialization time
+   - matched input count
+   - matched scan count
+   - staged spectrum count
+4. Derived comparison metrics:
+   - post-search scoring/reporting time by subtracting CometPlus or fast-path phase totals from outer wall time
+   - retained-scan totals from `scan prefilter: ... -> <N> scans retained`
+   - baseline-only and fastpath-only novel peptide counts
+   - scan-universe deltas between the mzMLb baseline and parquet fast path
+   - PSM-delta-aware conclusion wording: when fast-path final PSM rows are not lower than baseline, the note reports disagreement diagnostics (scan-selection/search-side/ranking counts) without a "lost-row percentage" denominator
+5. Exact scan-set attribution from `local_test/benchmark_pxd010154_scan_attribution.py`:
+   - recover exact baseline retained `(idn, scan_id)` keys by parsing retained keep-tmp filtered MGFs
+   - compare them against `<output-prefix>.fastpath.scan_matches.tsv`
+   - write sidecar TSVs under the keep-tmp recovery output directory for:
+     - exact baseline retained scans
+     - baseline-only scans and fastpath-only scans with left-joined `PXD010154_ms2.parquet` features so scans absent from the parquet universe still remain in the exact list
+     - per-file overlap summary
+     - PSM-loss and peptide-loss attribution summaries
+     - m/z and RT bin summaries
+   - classify each baseline final novel PSM row into:
+     - direct scan mismatch (`scan` absent from fastpath matched set)
+     - matched-scan search-side difference
+     - matched-scan ranking/FDR difference
+
+## 2.4 PXD010154 fast-path scan-mismatch note generator
+
+`local_test/analyze_pxd010154_fastpath_scan_mismatch.py` is a second repo-local analysis helper that reuses the existing scan-attribution sidecars and completed fast-path artifacts to explain why baseline-only and fastpath-only scan sets diverge.
+
+It is also outside the production CLI path. Its job is to write `notes/20260422.pxd010154_fastpath_scan_mismatch_analysis.md` without rerunning full ProtCosmo searches.
+
+The helper:
+
+1. Reads existing sidecars:
+   - `baseline_only_scans.tsv`
+   - `fastpath_only_scans.tsv`
+   - the detailed internal novel TSV
+   - completed fast-path log and scan-match TSV
+2. Tests exact detailed-window membership for each scan under:
+   - raw precursor mz
+   - `mz - 1.003355 / charge`
+   - `mz + 1.003355 / charge`
+3. Fetches representative sample precursor rows back from per-file `*.mgf.parquet` files and computes neutral masses from the shifted mz values.
+4. Summarizes PTM coverage directly from `peptide_with_mod` in the detailed internal TSV.
+5. Writes a note that compares:
+   - existing data artifacts
+   - current DuckDB matching code in `src/protcosmo/utils/parquet_fastpath.py`
+   - CometPlus novel prefilter behavior in `NovelModeUtilsPrefilter.cpp`
+6. Inspects the checked-out `src/protcosmo/utils/parquet_fastpath.py` to report whether the current source uses upward (`+ offset / charge`) or downward (`- offset / charge`) isotope-window shifts.
+7. Lists the targeted production-side isotope tests already present in `local_test/test_protcosmo_utils.py` so the note distinguishes old artifact behavior from current source state.
+
+This helper is analysis-only. It does not change the production fast-path behavior.
+
 ## 3. Important Behavior Notes
 
 1. Unknown CLI options are passed through to CometPlus only in CometPlus path.
@@ -300,3 +426,4 @@ Recommended places to read timing information after a full-scale run:
 8. `--thread` controls both CometPlus `num_threads` forwarding and parallel worker count for multi-group TSV scoring.
 9. `--known_peptide` is a first-class global ProtCosmo CLI option that resolves to an absolute path before CometPlus execution.
 10. `--output_known_peptide` is not modeled by ProtCosmo; users may still rely on raw passthrough for unmanaged CometPlus options.
+11. README fast-path docs include a dedicated "advantages and recommended usage" block plus a benchmark-only `--execute-fastpath-only` command template for rerunning only the parquet case while reusing baseline outputs.
