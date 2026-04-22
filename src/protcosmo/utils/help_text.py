@@ -45,7 +45,8 @@ Quick format notes:
 - --novel_protein: FASTA input.
 - --novel_peptide: FASTA or tokenized text (comma/space/tab/newline delimiters).
 - --known_peptide: reuse a previously exported CometPlus known-peptide cache.
-- --ms2-parquet and --mgf-parquet-dir: optional paired inputs that enable the two-pass DuckDB + mgf.parquet novel fast path.
+- --ms2-parquet enables the two-pass DuckDB + mgf.parquet novel fast path when all spectrum inputs are *.mgf.parquet.
+- There is no `--mgf-parquet-dir`; provide `*.mgf.parquet` paths directly in `--mass-file` or `--input_tsv`.
 - Fast-path thread rule: ProtCosmo forwards the user's --thread value unchanged when one is provided; otherwise it leaves CometPlus thread handling unchanged.
 - --output_internal_novel_peptide: auto-enabled in novel mode as `--output-dir/<output-prefix>.internal_novel_peptide.tsv`.
 - --internal_novel_peptide: reuse previously exported internal novel TSV.
@@ -84,7 +85,7 @@ Step 1. Build run configuration
     - text file, one mass-file path per line (blank lines and # comments ignored)
     - directory (all CometPlus-supported files in that directory are used)
   - CometPlus-supported suffixes recognized by ProtCosmo include:
-    .mgf, .mgf.gz, .mzML, .mzML.gz, .mzMLb, .mzXML, .mzXML.gz, .raw, .ms2, .cms2, .bms2
+    .mgf.parquet, .mgf, .mgf.gz, .mzML, .mzML.gz, .mzMLb, .mzXML, .mzXML.gz, .raw, .ms2, .cms2, .bms2
   - Duplicate mass-file paths are de-duplicated while keeping order.
   - --params and --database are required and each accepts only one value.
 - CLI --init-weights/--percolator-psms/--percolator-peptides each accept only one value.
@@ -98,10 +99,10 @@ Step 2. Run CometPlus for each mass file
   --output_percolatorfile 1, --max_duplicate_proteins -1
 - One run may include one or many spectrum input files.
 - Optional parquet fast path:
-  - only activates when both `--ms2-parquet` and `--mgf-parquet-dir` are provided;
+  - activates when `--ms2-parquet` is provided and all spectrum inputs are `*.mgf.parquet`;
   - only applies to novel-mode CometPlus runs;
   - pass 1 runs CometPlus on the original inputs, exports the detailed internal novel TSV, forwards `--known_peptide` when present, and stops before search;
-  - ProtCosmo then uses DuckDB to match scans from `--ms2-parquet`, extracts staged subset MGFs from `<basename>.mgf.parquet` files under `--mgf-parquet-dir`, and runs CometPlus pass 2 with `--internal_novel_peptide`;
+  - ProtCosmo then uses DuckDB to match scans from `--ms2-parquet`, extracts staged subset MGFs directly from the provided `*.mgf.parquet` inputs, and runs CometPlus pass 2 with `--internal_novel_peptide`;
   - pass 2 does not forward `--novel_peptide`, `--novel_protein`, or `--known_peptide`;
   - when `--thread` is provided, ProtCosmo forwards that exact value to both fast-path CometPlus passes.
 - Optional ProtCosmo-controlled options forwarded to CometPlus:
@@ -190,12 +191,10 @@ Option details and format examples:
 
 --ms2-parquet <file>
 - Optional global ms2.parquet input for the novel fast path.
-- Must be provided together with `--mgf-parquet-dir`.
-- When both parquet inputs are absent, ProtCosmo stays on the current mzML/mzMLb workflow.
-
---mgf-parquet-dir <dir>
-- Optional directory containing `<basename>.mgf.parquet` files for the novel fast path.
-- Must be provided together with `--ms2-parquet`.
+- Fast path activates when this is provided and all spectrum inputs are `*.mgf.parquet`.
+- There is no `--mgf-parquet-dir`; provide exact `*.mgf.parquet` paths in `--mass-file` or `--input_tsv`.
+- `*.mgf.parquet` inputs without `--ms2-parquet` fail fast.
+- `--ms2-parquet` with non-`*.mgf.parquet` inputs also fails fast.
 - ProtCosmo stages subset `<basename>.mgf` files under the output directory, preserves the original basenames, and removes them afterward unless `--keep-tmp` is set.
 
 --output_internal_novel_peptide <file>

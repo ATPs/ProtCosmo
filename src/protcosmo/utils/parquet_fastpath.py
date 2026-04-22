@@ -246,8 +246,18 @@ def build_fastpath_subset_mgfs(
 
     if not config.fastpath_enabled:
         raise ValueError("Fast path subset building requires config.fastpath_enabled=True.")
-    if config.ms2_parquet is None or config.mgf_parquet_dir is None:
-        raise ValueError("Fast path subset building requires --ms2-parquet and --mgf-parquet-dir.")
+    if config.ms2_parquet is None:
+        raise ValueError("Fast path subset building requires --ms2-parquet.")
+    non_parquet_inputs = [
+        str(Path(path).resolve())
+        for path in run.mass_files
+        if not Path(str(path)).name.lower().endswith(".mgf.parquet")
+    ]
+    if non_parquet_inputs:
+        raise ValueError(
+            "Fast path subset building requires all run.mass_files to be .mgf.parquet inputs. "
+            f"Unsupported input(s): {', '.join(non_parquet_inputs[:3])}"
+        )
 
     output_dir = output_dir.resolve()
     staged_dir = (output_dir / f"{config.output_prefix}.fastpath_subset_mgfs").resolve()
@@ -266,6 +276,7 @@ def build_fastpath_subset_mgfs(
     scan_match_start = perf_counter()
     internal_df = _load_detailed_internal_novel_table(internal_novel_path)
     key_to_mass_file = {derive_mass_file_key(path): str(Path(path).resolve()) for path in run.mass_files}
+    key_to_mgf_parquet = {derive_mass_file_key(path): str(Path(path).resolve()) for path in run.mass_files}
     ordered_keys = [derive_mass_file_key(path) for path in run.mass_files]
     numeric_ids = _resolve_numeric_mass_file_ids(ordered_keys)
     scan_matches = _query_scan_matches(
@@ -293,14 +304,12 @@ def build_fastpath_subset_mgfs(
     }
 
     write_start = perf_counter()
-    mgf_parquet_dir = Path(config.mgf_parquet_dir)
     n_workers = max(1, config.fastpath_thread or 1)
 
     # ProcessPoolExecutor bypasses the GIL, giving true parallelism for the
     # CPU-bound string formatting inside _write_spectra_to_handle.  Pass only
     # picklable primitives (str, list[int]) to avoid DataFrame serialization cost.
     futures: dict[str, Future[FastPathEntry]] = {}
-    mgf_parquet_dir_str = str(mgf_parquet_dir)
     staged_dir_str = str(staged_dir)
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         for key in ordered_keys:
@@ -308,8 +317,8 @@ def build_fastpath_subset_mgfs(
                 _process_one_file,
                 key,
                 key_to_mass_file[key],
+                key_to_mgf_parquet[key],
                 scan_groups.get(key, []),
-                mgf_parquet_dir_str,
                 staged_dir_str,
             )
 
@@ -392,8 +401,8 @@ def _resolve_numeric_mass_file_ids(keys: Sequence[str]) -> dict[int, str]:
 def _process_one_file(
     key: str,
     mass_file: str,
+    mgf_parquet_path: str,
     scan_ids: List[int],
-    mgf_parquet_dir_str: str,
     staged_dir_str: str,
 ) -> FastPathEntry:
     """Query one mgf.parquet and write its subset MGF.
@@ -413,9 +422,8 @@ def _process_one_file(
             staged_spectrum_count=0,
         )
 
-    mgf_parquet_dir = Path(mgf_parquet_dir_str)
     staged_dir = Path(staged_dir_str)
-    mgf_parquet = (mgf_parquet_dir / f"{key}.mgf.parquet").resolve()
+    mgf_parquet = Path(mgf_parquet_path).resolve()
     if not mgf_parquet.is_file():
         raise FileNotFoundError(f"Fast path MGF parquet file does not exist: {mgf_parquet}")
 

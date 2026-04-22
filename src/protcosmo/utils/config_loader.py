@@ -72,7 +72,6 @@ class PipelineConfig:
     novel_peptide: Optional[str]
     known_peptide: Optional[str]
     ms2_parquet: Optional[str]
-    mgf_parquet_dir: Optional[str]
     fastpath_enabled: bool
     fastpath_thread: Optional[int]
     output_internal_novel_peptide: Optional[str]
@@ -137,6 +136,34 @@ def _resolve_path(raw: str, *, base_dir: Path) -> str:
     else:
         candidate = candidate.resolve()
     return str(candidate)
+
+
+def _is_mgf_parquet_input(path: str) -> bool:
+    return Path(str(path)).name.lower().endswith(".mgf.parquet")
+
+
+def _resolve_fastpath_enabled(*, ms2_parquet: Optional[str], mass_files: List[str]) -> bool:
+    if not mass_files:
+        return False
+
+    mgf_parquet_flags = [_is_mgf_parquet_input(path) for path in mass_files]
+    has_mgf_parquet = any(mgf_parquet_flags)
+    all_mgf_parquet = all(mgf_parquet_flags)
+
+    if has_mgf_parquet and not all_mgf_parquet:
+        raise ValueError(
+            "Mixed spectrum suffixes are not supported: all inputs must be .mgf.parquet "
+            "when any .mgf.parquet input is present."
+        )
+    if has_mgf_parquet and ms2_parquet is None:
+        raise ValueError(
+            "Detected .mgf.parquet spectrum inputs, but --ms2-parquet is missing."
+        )
+    if ms2_parquet is not None and not all_mgf_parquet:
+        raise ValueError(
+            "--ms2-parquet requires all spectrum inputs to be .mgf.parquet."
+        )
+    return ms2_parquet is not None and all_mgf_parquet
 
 
 def _normalize_header_key(name: str) -> str:
@@ -396,9 +423,6 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
         raise ValueError("--stop-after-cometplus cannot be used with --input-pin.")
 
     ms2_parquet = _single_optional_value("--ms2-parquet", getattr(args, "ms2_parquet", None))
-    mgf_parquet_dir = _single_optional_value("--mgf-parquet-dir", getattr(args, "mgf_parquet_dir", None))
-    if (ms2_parquet is None) != (mgf_parquet_dir is None):
-        raise ValueError("--ms2-parquet and --mgf-parquet-dir must be provided together.")
     if ms2_parquet is not None:
         resolved_ms2 = Path(ms2_parquet).expanduser().resolve()
         if not resolved_ms2.exists():
@@ -406,19 +430,10 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
         if not resolved_ms2.is_file():
             raise ValueError(f"--ms2-parquet must be a file: {resolved_ms2}")
         ms2_parquet = str(resolved_ms2)
-    if mgf_parquet_dir is not None:
-        resolved_mgf_dir = Path(mgf_parquet_dir).expanduser().resolve()
-        if not resolved_mgf_dir.exists():
-            raise ValueError(f"--mgf-parquet-dir path does not exist: {resolved_mgf_dir}")
-        if not resolved_mgf_dir.is_dir():
-            raise ValueError(f"--mgf-parquet-dir must be a directory: {resolved_mgf_dir}")
-        mgf_parquet_dir = str(resolved_mgf_dir)
-    fastpath_enabled = ms2_parquet is not None and mgf_parquet_dir is not None
-    fastpath_thread = resolve_fastpath_thread(args.thread) if fastpath_enabled else None
 
     if input_pin:
-        if fastpath_enabled:
-            raise ValueError("--ms2-parquet/--mgf-parquet-dir cannot be used with --input-pin.")
+        if ms2_parquet is not None:
+            raise ValueError("--ms2-parquet cannot be used with --input-pin.")
         resolved_pin = str(Path(_require_single_value("--input-pin", input_pin)).expanduser().resolve())
         init_weights = _single_optional_value("--init-weights", args.init_weights)
         percolator_psms = _single_optional_value("--percolator-psms", args.percolator_psms)
@@ -454,7 +469,6 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
             novel_peptide=args.novel_peptide,
             known_peptide=getattr(args, "known_peptide", None),
             ms2_parquet=None,
-            mgf_parquet_dir=None,
             fastpath_enabled=False,
             fastpath_thread=None,
             output_internal_novel_peptide=getattr(args, "output_internal_novel_peptide", None),
@@ -484,15 +498,6 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
     if input_tsv_text:
         if getattr(args, "mass_file", None) is not None and str(getattr(args, "mass_file", "")).strip():
             raise ValueError("--mass-file cannot be used together with --input_tsv.")
-        if fastpath_enabled and not any(
-            x is not None and str(x).strip()
-            for x in (
-                args.novel_protein,
-                args.novel_peptide,
-                getattr(args, "internal_novel_peptide", None),
-            )
-        ):
-            raise ValueError("--ms2-parquet/--mgf-parquet-dir require novel mode inputs.")
 
         input_tsv_path = Path(input_tsv_text).expanduser()
         if not input_tsv_path.is_absolute():
@@ -511,6 +516,18 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
         )
 
         mass_files = [row.mass_file for row in tsv_rows]
+        fastpath_enabled = _resolve_fastpath_enabled(ms2_parquet=ms2_parquet, mass_files=mass_files)
+        fastpath_thread = resolve_fastpath_thread(args.thread) if fastpath_enabled else None
+        novel_mode = any(
+            x is not None and str(x).strip()
+            for x in (
+                args.novel_protein,
+                args.novel_peptide,
+                getattr(args, "internal_novel_peptide", None),
+            )
+        )
+        if fastpath_enabled and not novel_mode:
+            raise ValueError("--ms2-parquet requires novel mode inputs.")
 
         first_group = scoring_groups[0] if scoring_groups else None
         run = RunConfig(
@@ -537,7 +554,6 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
             novel_peptide=args.novel_peptide,
             known_peptide=getattr(args, "known_peptide", None),
             ms2_parquet=ms2_parquet,
-            mgf_parquet_dir=mgf_parquet_dir,
             fastpath_enabled=fastpath_enabled,
             fastpath_thread=fastpath_thread,
             output_internal_novel_peptide=getattr(args, "output_internal_novel_peptide", None),
@@ -572,8 +588,10 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
             getattr(args, "internal_novel_peptide", None),
         )
     )
+    fastpath_enabled = _resolve_fastpath_enabled(ms2_parquet=ms2_parquet, mass_files=mass_files)
+    fastpath_thread = resolve_fastpath_thread(args.thread) if fastpath_enabled else None
     if fastpath_enabled and not novel_mode:
-        raise ValueError("--ms2-parquet/--mgf-parquet-dir require novel mode inputs.")
+        raise ValueError("--ms2-parquet requires novel mode inputs.")
     merge_multi_input_novel = novel_mode and len(mass_files) > 1
     run_input_groups: List[List[str]]
     if merge_multi_input_novel:
@@ -636,7 +654,6 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
         novel_peptide=args.novel_peptide,
         known_peptide=getattr(args, "known_peptide", None),
         ms2_parquet=ms2_parquet,
-        mgf_parquet_dir=mgf_parquet_dir,
         fastpath_enabled=fastpath_enabled,
         fastpath_thread=fastpath_thread,
         output_internal_novel_peptide=getattr(args, "output_internal_novel_peptide", None),

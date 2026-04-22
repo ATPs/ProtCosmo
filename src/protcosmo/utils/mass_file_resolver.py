@@ -7,6 +7,7 @@ from typing import Iterable, List
 
 
 SUPPORTED_MASS_FILE_SUFFIXES = (
+    ".mgf.parquet",
     ".mzml",
     ".mzmlb",
     ".mzxml",

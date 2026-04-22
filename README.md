@@ -10,7 +10,7 @@ It is designed for workflows that need novel peptide/protein discovery while kee
 3. Selects one winner PSM per spectrum.
 4. Estimates q-value and PEP by lookup from reference PSM/peptide tables.
 5. Writes novel-focused report TSV files.
-6. Optionally uses a two-pass DuckDB + `mgf.parquet` fast path for novel runs when `--ms2-parquet` and `--mgf-parquet-dir` are both provided.
+6. Optionally uses a two-pass DuckDB + `mgf.parquet` fast path for novel runs when `--ms2-parquet` is provided and all spectrum inputs are `*.mgf.parquet`.
 
 Supported run modes:
 
@@ -75,7 +75,10 @@ Notes:
 - `--input-pin` takes precedence when both `--input-pin` and `--input_tsv` are provided.
 - CLI `--init-weights`, `--percolator-psms`, `--percolator-peptides` each accept only one value.
 - `--known_peptide` is a global optional CometPlus cache-reuse input; ProtCosmo does not model `--output_known_peptide`.
-- `--ms2-parquet` and `--mgf-parquet-dir` must be provided together to enable the parquet fast path.
+- Parquet fast path activates when `--ms2-parquet` is provided and all spectrum inputs are `*.mgf.parquet`.
+- `--mgf-parquet-dir` has been removed; provide `*.mgf.parquet` paths directly via `--mass-file` or `--input_tsv` `mass-file` cells.
+- `*.mgf.parquet` inputs without `--ms2-parquet` are rejected.
+- `--ms2-parquet` with non-`*.mgf.parquet` inputs is rejected.
 - In the parquet fast path, ProtCosmo forwards the user's `--thread` value unchanged when one is provided; if `--thread` is omitted, CometPlus uses its normal default thread behavior.
 - In the parquet fast path, `--known_peptide` is forwarded only in pass 1; pass 2 resumes with `--internal_novel_peptide`.
 - In the parquet fast path, `isotope_error` matching follows CometPlus novel prefilter semantics, including the signed offset sets for modes `0..7`; raw precursor mz is matched against internal windows shifted by the same effective isotope offset in mz-space.
@@ -234,11 +237,10 @@ Behavior in this mode:
 ```bash
 protcosmo \
   --cometplus /data/p/comet/Comet/ProtCosmo/CometPlus/cometplus \
-  --input_tsv /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/ms2duck/protcosmo.input.tsv \
+  --input_tsv /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/ms2duck/protcosmo.input.fastpath.mgf_parquet.tsv \
   --novel_peptide /data/p/xiaolong/ProtCosmo/ProtCosmo/local_test/data/novel_peptides \
   --known_peptide /data2/pub/proteome/web/protinsight/comet/proteins/20260206/cmt_2026_01_input_with_decoy_HCD__protinsight_proteinseq.target.decoy.fasta.idx.known_peptide.txt \
   --ms2-parquet /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/ms2duck/PXD010154_ms2.parquet \
-  --mgf-parquet-dir /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/mzDuck \
   --output-dir /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/protcosmo_fastpath \
   --thread 20 \
   --log
@@ -247,7 +249,7 @@ protcosmo \
 Behavior in this mode:
 
 1. Pass 1 runs CometPlus on the original inputs, exports the detailed internal novel TSV, forwards `--known_peptide` when present, and stops before search.
-2. ProtCosmo uses DuckDB against `--ms2-parquet` plus per-file `*.mgf.parquet` files to stage compact subset MGFs, with `isotope_error` handling matched to CometPlus novel prefiltering.
+2. ProtCosmo uses DuckDB against `--ms2-parquet` plus the provided `*.mgf.parquet` inputs to stage compact subset MGFs, with `isotope_error` handling matched to CometPlus novel prefiltering.
 3. Pass 2 resumes CometPlus with `--internal_novel_peptide` on the staged subset MGFs.
 4. Search/scoring/reporting after pass 2 are unchanged from the existing workflow.
 
@@ -261,10 +263,11 @@ Fast-path advantages and recommended usage:
    - Multi-file novel-peptide/novel-protein runs, especially when total input size is large.
    - Cases where `<project>_ms2.parquet` and per-file `*.mgf.parquet` are already available.
 3. When not to use it:
-   - If `--ms2-parquet` or `--mgf-parquet-dir` is unavailable.
+   - If `--ms2-parquet` is unavailable.
    - If you are in `--input-pin` mode (CometPlus is skipped, so fast path is irrelevant).
 4. Operational notes:
-   - Provide both `--ms2-parquet` and `--mgf-parquet-dir` together, otherwise fast path is disabled.
+   - Fast path requires `--ms2-parquet` and `mass-file` inputs ending with `*.mgf.parquet`.
+   - No separate parquet-directory flag is used; list the exact `*.mgf.parquet` files in `--mass-file` or `--input_tsv`.
    - Keep `--thread` explicit for reproducible benchmark comparisons.
    - In pass 2, ProtCosmo resumes with `--internal_novel_peptide` and does not forward `--known_peptide`.
 5. Benchmark-only rerun pattern (reuse baseline outputs, rerun only fast path):

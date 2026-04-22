@@ -262,15 +262,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="ms2_parquet",
         help=(
             "optional global ms2.parquet input for the two-pass novel fast path.\n"
-            "Must be used together with --mgf-parquet-dir."
-        ),
-    )
-    novel_group.add_argument(
-        "--mgf-parquet-dir",
-        dest="mgf_parquet_dir",
-        help=(
-            "optional directory containing <basename>.mgf.parquet files for the two-pass novel fast path.\n"
-            "Must be used together with --ms2-parquet."
+            "Fast path activates when this is provided and all spectrum inputs are *.mgf.parquet.\n"
+            "Provide *.mgf.parquet paths directly via --mass-file or --input_tsv; there is no separate parquet-dir flag."
         ),
     )
     novel_group.add_argument(

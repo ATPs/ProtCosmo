@@ -56,8 +56,11 @@ Early-stop modes stop before scoring outputs.
    - stop-after flags are mutually exclusive;
    - `--input-pin` cannot combine with stop-after flags.
 4. Resolve optional parquet fast-path inputs:
-   - `--ms2-parquet` and `--mgf-parquet-dir` must be provided together;
-   - both paths must exist;
+   - `--ms2-parquet` is optional and must exist when provided;
+   - parquet fast path activates only when `--ms2-parquet` is provided and all resolved spectrum inputs are `*.mgf.parquet`;
+   - mixed suffix inputs (some `*.mgf.parquet`, some not) are rejected;
+   - `*.mgf.parquet` inputs without `--ms2-parquet` are rejected;
+   - `--ms2-parquet` with non-`*.mgf.parquet` inputs is rejected;
    - parquet fast path is rejected with `--input-pin`;
    - parquet fast path requires novel-mode inputs;
    - when the user provides `--thread`, the parquet fast path forwards that exact value to both CometPlus passes; otherwise it leaves thread handling unchanged.
@@ -95,7 +98,7 @@ Early-stop modes stop before scoring outputs.
 10. Scan-filter gating:
     - if final run count > 1 and scan args are present, disable scan filters and append warning.
 
-Output is `PipelineConfig` with normalized runs and runtime booleans (`force`, `log`, `use_input_tsv`) plus fast-path metadata (`ms2_parquet`, `mgf_parquet_dir`, `fastpath_enabled`, `fastpath_thread`) and optional TSV scoring group metadata.
+Output is `PipelineConfig` with normalized runs and runtime booleans (`force`, `log`, `use_input_tsv`) plus fast-path metadata (`ms2_parquet`, `fastpath_enabled`, `fastpath_thread`) and optional TSV scoring group metadata.
 
 ## Step 1.1: Shared input key extraction
 
@@ -157,6 +160,7 @@ When `fastpath_enabled` is true, `protcosmo.run_pipeline` uses a two-pass search
    - if `--internal_novel_peptide` is provided, ProtCosmo reuses it directly;
    - else if the expected internal TSV already exists and `--force` is not set, ProtCosmo reuses that TSV and skips pass 1.
 4. DuckDB subset staging:
+   - use the run's resolved `mass_files` directly as source `*.mgf.parquet` inputs (no separate mgf-parquet-dir);
    - read the detailed internal TSV and require `charge`, `mz_window_min`, and `mz_window_max`;
    - read charge policy from the run's `.params` file: `override_charge`, `precursor_charge`, and `isotope_error`;
    - build isotope-shifted mz windows from the same signed isotope-offset set that CometPlus uses for `isotope_error` (`0`, `+1`, `-1`, `+4`, etc., depending on the selected mode);
