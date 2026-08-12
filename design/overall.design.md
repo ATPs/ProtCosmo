@@ -56,7 +56,10 @@ Early-stop modes stop before scoring outputs.
    - stop-after flags are mutually exclusive;
    - `--input-pin` cannot combine with stop-after flags.
 4. Resolve optional parquet fast-path inputs:
-   - `--ms2-parquet` is optional and must exist when provided;
+   - `--ms2-parquet` is optional and accepts either one parquet file or a directory
+     of direct parquet partitions; directories are passed to DuckDB as `*.parquet`
+     globs so layouts such as `ms2.parquet/<idn>.ms2.parquet` do not need a
+     consolidated copy;
    - parquet fast path activates only when `--ms2-parquet` is provided and all resolved spectrum inputs are `*.mgf.parquet`;
    - mixed suffix inputs (some `*.mgf.parquet`, some not) are rejected;
    - `*.mgf.parquet` inputs without `--ms2-parquet` are rejected;

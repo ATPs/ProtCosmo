@@ -129,6 +129,25 @@ def _single_optional_value(flag: str, value: Optional[str]) -> Optional[str]:
     return values[0]
 
 
+def _resolve_ms2_parquet_input(raw_value: str) -> str:
+    """Resolve a combined ms2 parquet file or a directory of parquet partitions.
+
+    The returned directory form is a DuckDB glob, allowing the fast path to
+    query project layouts that store one `<idn>.ms2.parquet` file per run.
+    """
+
+    resolved = Path(raw_value).expanduser().resolve()
+    if resolved.is_file():
+        return str(resolved)
+    if resolved.is_dir():
+        if not any(resolved.glob("*.parquet")):
+            raise ValueError(f"--ms2-parquet directory contains no parquet files: {resolved}")
+        return str(resolved / "*.parquet")
+    if resolved.exists():
+        raise ValueError(f"--ms2-parquet must be a file or parquet directory: {resolved}")
+    raise ValueError(f"--ms2-parquet path does not exist: {resolved}")
+
+
 def _resolve_path(raw: str, *, base_dir: Path) -> str:
     candidate = Path(str(raw).strip()).expanduser()
     if not candidate.is_absolute():
@@ -424,12 +443,7 @@ def load_pipeline_config(args, passthrough_args: List[str]) -> PipelineConfig:
 
     ms2_parquet = _single_optional_value("--ms2-parquet", getattr(args, "ms2_parquet", None))
     if ms2_parquet is not None:
-        resolved_ms2 = Path(ms2_parquet).expanduser().resolve()
-        if not resolved_ms2.exists():
-            raise ValueError(f"--ms2-parquet path does not exist: {resolved_ms2}")
-        if not resolved_ms2.is_file():
-            raise ValueError(f"--ms2-parquet must be a file: {resolved_ms2}")
-        ms2_parquet = str(resolved_ms2)
+        ms2_parquet = _resolve_ms2_parquet_input(ms2_parquet)
 
     if input_pin:
         if ms2_parquet is not None:

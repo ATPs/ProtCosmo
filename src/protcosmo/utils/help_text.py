@@ -189,8 +189,9 @@ Option details and format examples:
 - `--output_known_peptide` is not modeled as a first-class ProtCosmo option.
 - When the parquet fast path is enabled, ProtCosmo forwards `--known_peptide` only in pass 1.
 
---ms2-parquet <file>
-- Optional global ms2.parquet input for the novel fast path.
+- Optional global ms2.parquet file or directory of parquet partitions for the novel fast path.
+- A directory is read as its direct `*.parquet` files, allowing layouts such as
+  `ms2.parquet/<idn>.ms2.parquet` without consolidating the data first.
 - Fast path activates when this is provided and all spectrum inputs are `*.mgf.parquet`.
 - There is no `--mgf-parquet-dir`; provide exact `*.mgf.parquet` paths in `--mass-file` or `--input_tsv`.
 - `*.mgf.parquet` inputs without `--ms2-parquet` fail fast.
